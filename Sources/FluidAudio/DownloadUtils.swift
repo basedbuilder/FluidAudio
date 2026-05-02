@@ -499,7 +499,7 @@ public class DownloadUtils {
         )
         defer { session.finishTasksAndInvalidate() }
 
-        let (tempURL, response) = try await session.download(for: request)
+        let (tempURL, response) = try await session.download(for: request, delegate: delegate)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw HuggingFaceDownloadError.invalidResponse
