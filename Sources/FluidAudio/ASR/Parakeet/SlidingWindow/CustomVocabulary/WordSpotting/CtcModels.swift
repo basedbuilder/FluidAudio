@@ -57,7 +57,23 @@ public struct CtcModels: Sendable {
     }
 }
 
+/// Lightweight metadata from the CTC vocabulary assets.
+public struct CtcVocabularyMetadata: Sendable {
+    public let directory: URL
+    public let vocabularyCount: Int
+
+    /// The blank token id implied by the vocabulary size.
+    public var blankId: Int {
+        vocabularyCount
+    }
+}
+
 extension CtcModels {
+    /// Asset names needed by `CtcTokenizer` and CTC vocabulary metadata.
+    public static let tokenizerAssetNames = [
+        "tokenizer.json",
+        ModelNames.CTC.vocabularyPath,
+    ]
 
     /// Load CTC models directly from a custom directory (e.g., canary-1b-v2).
     ///
@@ -246,6 +262,43 @@ extension CtcModels {
         return try await load(from: targetDir, variant: variant)
     }
 
+    /// Download only tokenizer/vocabulary assets for CTC rescoring.
+    ///
+    /// This avoids downloading and compiling the separate CTC acoustic models
+    /// when a caller already has CTC logits from a hybrid TDT+CTC ASR model.
+    @discardableResult
+    public static func downloadTokenizerAssets(
+        to directory: URL? = nil,
+        variant: CtcModelVariant = .ctc110m
+    ) async throws -> URL {
+        let targetDir = directory ?? defaultCacheDirectory(for: variant)
+        try FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
+
+        for assetName in tokenizerAssetNames {
+            let destination = targetDir.appendingPathComponent(assetName)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                continue
+            }
+
+            let encodedPath = assetName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? assetName
+            let fileURL = try ModelRegistry.resolveModel(variant.repo.remotePath, encodedPath)
+            let data = try await DownloadUtils.fetchHuggingFaceFile(
+                from: fileURL,
+                description: "\(variant.repo.folderName)/\(assetName)"
+            )
+            try data.write(to: destination, options: .atomic)
+            logger.info("Downloaded CTC tokenizer asset \(assetName) to \(destination.path)")
+        }
+
+        return targetDir
+    }
+
+    /// Load vocabulary metadata without loading the CTC acoustic models.
+    public static func loadVocabularyMetadata(from directory: URL) throws -> CtcVocabularyMetadata {
+        let vocabulary = try loadVocabulary(from: directory)
+        return CtcVocabularyMetadata(directory: directory, vocabularyCount: vocabulary.count)
+    }
+
     /// Default CoreML configuration for CTC inference.
     public static func defaultConfiguration() -> MLModelConfiguration {
         MLModelConfigurationUtils.defaultConfiguration(computeUnits: .cpuAndNeuralEngine)
@@ -284,7 +337,7 @@ extension CtcModels {
     }
 
     /// Load vocabulary from vocab.json in the given directory.
-    private static func loadVocabulary(from directory: URL) throws -> [Int: String] {
+    static func loadVocabulary(from directory: URL) throws -> [Int: String] {
         let vocabPath = directory.appendingPathComponent("vocab.json")
         guard FileManager.default.fileExists(atPath: vocabPath.path) else {
             throw AsrModelsError.modelNotFound("vocab.json", vocabPath)

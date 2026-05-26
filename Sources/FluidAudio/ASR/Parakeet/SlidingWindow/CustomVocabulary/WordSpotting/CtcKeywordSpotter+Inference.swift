@@ -208,27 +208,22 @@ extension CtcKeywordSpotter {
 
         // Convert logits -> log-probabilities and trim padding frames.
         // Apply temperature scaling (CTC_TEMPERATURE) and blank bias (BLANK_BIAS)
-        let allLogProbs = try makeLogProbs(from: ctcRaw, temperature: temperature, blankBias: blankBias)
-        let trimmed = trimLogProbs(allLogProbs, audioSampleCount: clampedCount)
-        let frameCount = trimmed.count
+        let result = try Self.logProbResult(
+            from: ctcRaw,
+            audioSampleCount: clampedCount,
+            blankId: blankId,
+            temperature: temperature,
+            blankBias: blankBias,
+            debugLogger: debugMode ? { logger.debug("\($0)") } : nil
+        )
 
         if debugMode {
             logger.debug(
-                "Log-probs: \(trimmed.count) frames (total: \(allLogProbs.count)), vocab size: \(trimmed.first?.count ?? 0)"
+                "Log-probs: \(result.logProbs.count) frames, vocab size: \(result.logProbs.first?.count ?? 0)"
             )
         }
 
-        let frameDuration =
-            frameCount > 0
-            ? Double(clampedCount) / Double(frameCount) / Double(sampleRate)
-            : 0
-
-        return CtcLogProbResult(
-            logProbs: trimmed,
-            frameDuration: frameDuration,
-            totalFrames: frameCount,
-            audioSamplesUsed: clampedCount
-        )
+        return result
     }
 
     // MARK: - Audio Preparation
@@ -347,8 +342,45 @@ extension CtcKeywordSpotter {
 
     // MARK: - Log Probability Processing
 
-    private func makeLogProbs(
+    static func logProbResult(
         from ctcOutput: MLMultiArray,
+        audioSampleCount: Int,
+        blankId: Int = ContextBiasingConstants.defaultBlankId,
+        maxModelSamples: Int = ASRConstants.maxModelSamples,
+        sampleRate: Int = ASRConstants.sampleRate,
+        temperature: Float = ContextBiasingConstants.ctcTemperature,
+        blankBias: Float = ContextBiasingConstants.blankBias,
+        debugLogger: ((String) -> Void)? = nil
+    ) throws -> CtcLogProbResult {
+        let allLogProbs = try makeLogProbs(
+            from: ctcOutput,
+            blankId: blankId,
+            temperature: temperature,
+            blankBias: blankBias
+        )
+        let trimmed = trimLogProbs(
+            allLogProbs,
+            audioSampleCount: audioSampleCount,
+            maxModelSamples: maxModelSamples,
+            debugLogger: debugLogger
+        )
+        let frameCount = trimmed.count
+        let frameDuration =
+            frameCount > 0
+            ? Double(audioSampleCount) / Double(frameCount) / Double(sampleRate)
+            : 0
+
+        return CtcLogProbResult(
+            logProbs: trimmed,
+            frameDuration: frameDuration,
+            totalFrames: frameCount,
+            audioSamplesUsed: audioSampleCount
+        )
+    }
+
+    private static func makeLogProbs(
+        from ctcOutput: MLMultiArray,
+        blankId: Int,
         temperature: Float = 1.0,
         blankBias: Float = 0.0
     ) throws -> [[Float]] {
@@ -404,7 +436,7 @@ extension CtcKeywordSpotter {
         return logProbs
     }
 
-    private func logSoftmax(_ logits: [Float], temperature: Float = 1.0) -> [Float] {
+    private static func logSoftmax(_ logits: [Float], temperature: Float = 1.0) -> [Float] {
         guard !logits.isEmpty else { return [] }
 
         // Apply temperature scaling: divide logits by temperature before softmax
@@ -430,7 +462,12 @@ extension CtcKeywordSpotter {
         return result
     }
 
-    private func trimLogProbs(_ logProbs: [[Float]], audioSampleCount: Int) -> [[Float]] {
+    private static func trimLogProbs(
+        _ logProbs: [[Float]],
+        audioSampleCount: Int,
+        maxModelSamples: Int,
+        debugLogger: ((String) -> Void)? = nil
+    ) -> [[Float]] {
         guard !logProbs.isEmpty else { return logProbs }
 
         let totalFrames = logProbs.count
@@ -442,12 +479,12 @@ extension CtcKeywordSpotter {
         let validFrames = Int(ceil(Double(audioSampleCount) / samplesPerFrame))
         let clampedFrames = max(1, min(validFrames, totalFrames))
 
-        if debugMode {
-            logger.debug("[DEBUG] Trimming CTC frames:")
-            logger.debug(
+        if let debugLogger {
+            debugLogger("[DEBUG] Trimming CTC frames:")
+            debugLogger(
                 "[DEBUG]   totalFrames=\(totalFrames), sampleCount=\(audioSampleCount), maxModelSamples=\(maxModelSamples)"
             )
-            logger.debug(
+            debugLogger(
                 "[DEBUG]   samplesPerFrame=\(String(format: "%.2f", samplesPerFrame)), validFrames=\(validFrames), clampedFrames=\(clampedFrames)"
             )
         }

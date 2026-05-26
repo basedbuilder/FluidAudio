@@ -1,9 +1,14 @@
+import CoreML
 import Foundation
 
 extension AsrManager {
 
     internal func transcribeWithState(
-        _ audioSamples: [Float], decoderState: inout TdtDecoderState, language: Language? = nil
+        _ audioSamples: [Float],
+        decoderState: inout TdtDecoderState,
+        language: Language? = nil,
+        customVocabulary: CustomVocabularyContext? = nil,
+        vocabularyRescorer: VocabularyRescorer? = nil
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
         let minimumRequiredSamples = ASRConstants.minimumRequiredSamples(forSampleRate: config.sampleRate)
@@ -15,13 +20,15 @@ extension AsrManager {
         if audioSamples.count <= ASRConstants.maxModelSamples {
             let (alignedSamples, frameAlignedLength) = frameAlignedAudio(audioSamples)
             let paddedAudio: [Float] = padAudioIfNeeded(alignedSamples, targetLength: ASRConstants.maxModelSamples)
-            let (hypothesis, encoderSequenceLength) = try await executeMLInferenceWithTimings(
+            let shouldComputeCtcHead = customVocabulary != nil && vocabularyRescorer != nil
+            let (hypothesis, encoderSequenceLength, ctcHeadEncoderOutputRetained) = try await executeMLInferenceWithTimings(
                 paddedAudio,
                 originalLength: frameAlignedLength,
                 actualAudioFrames: nil,  // Will be calculated from originalLength
                 decoderState: &decoderState,
                 isLastChunk: true,  // Single-chunk: always first and last
-                language: language
+                language: language,
+                includeCtcHeadLogProbs: shouldComputeCtcHead
             )
 
             let result = processTranscriptionResult(
@@ -34,7 +41,17 @@ extension AsrManager {
                 processingTime: Date().timeIntervalSince(startTime)
             )
 
-            return result
+            return try await applyCtcHeadRescoringIfNeeded(
+                to: result,
+                ctcHeadEncoderOutputRetained: ctcHeadEncoderOutputRetained,
+                audioSampleCount: frameAlignedLength,
+                customVocabulary: customVocabulary,
+                vocabularyRescorer: vocabularyRescorer
+            )
+        }
+
+        if customVocabulary != nil || vocabularyRescorer != nil {
+            throw ASRError.processingFailed("CTC-head custom vocabulary rescoring is only available for single-window audio")
         }
 
         // ChunkProcessor handles stateless chunked transcription for long audio
@@ -64,7 +81,7 @@ extension AsrManager {
         let (alignedSamples, frameAlignedLength) = frameAlignedAudio(
             chunkSamples, allowAlignment: previousTokens.isEmpty)
         let padded = padAudioIfNeeded(alignedSamples, targetLength: ASRConstants.maxModelSamples)
-        let (hypothesis, encLen) = try await executeMLInferenceWithTimings(
+        let (hypothesis, encLen, _) = try await executeMLInferenceWithTimings(
             padded,
             originalLength: frameAlignedLength,
             actualAudioFrames: nil,  // Will be calculated from originalLength
@@ -88,6 +105,80 @@ extension AsrManager {
         }
 
         return (hypothesis.ySequence, hypothesis.timestamps, hypothesis.tokenConfidences, encLen)
+    }
+
+    private func applyCtcHeadRescoringIfNeeded(
+        to result: ASRResult,
+        ctcHeadEncoderOutputRetained: Bool,
+        audioSampleCount: Int,
+        customVocabulary: CustomVocabularyContext?,
+        vocabularyRescorer: VocabularyRescorer?
+    ) async throws -> ASRResult {
+        guard let customVocabulary, let vocabularyRescorer else {
+            return result
+        }
+        guard let tokenTimings = result.tokenTimings, !tokenTimings.isEmpty else {
+            return result
+        }
+
+        let vocabConfig = ContextBiasingConstants.rescorerConfig(forVocabSize: customVocabulary.terms.count)
+        let minSimilarity = max(vocabConfig.minSimilarity, customVocabulary.minSimilarity)
+        guard vocabularyRescorer.hasPotentialCtcTokenRescoreCandidate(
+            transcript: result.text,
+            tokenTimings: tokenTimings,
+            minSimilarity: minSimilarity
+        ) else {
+            return result
+        }
+
+        defer { retainedCtcHeadEncoderOutput = nil }
+        guard ctcHeadEncoderOutputRetained, let ctcHeadEncoderOutput = retainedCtcHeadEncoderOutput else {
+            throw ASRError.processingFailed("CTC-head custom vocabulary requested but no encoder output was retained")
+        }
+        let ctcHeadLogProbs = try await computeCtcHeadLogProbs(
+            encoderOutput: ctcHeadEncoderOutput,
+            audioSampleCount: audioSampleCount
+        )
+        guard !ctcHeadLogProbs.logProbs.isEmpty else {
+            throw ASRError.processingFailed("CTC-head custom vocabulary requested but no CTC log-probs were produced")
+        }
+
+        let rescored = vocabularyRescorer.ctcTokenRescore(
+            transcript: result.text,
+            tokenTimings: tokenTimings,
+            logProbs: ctcHeadLogProbs.logProbs,
+            frameDuration: ctcHeadLogProbs.frameDuration,
+            cbw: vocabConfig.cbw,
+            marginSeconds: ContextBiasingConstants.defaultMarginSeconds,
+            minSimilarity: minSimilarity
+        )
+
+        let detectedTerms = uniquePreservingOrder(
+            rescored.replacements.compactMap(\.replacementWord)
+        )
+        let appliedTerms = uniquePreservingOrder(
+            rescored.replacements
+                .filter(\.shouldReplace)
+                .compactMap(\.replacementWord)
+        )
+
+        return result.withRescoring(
+            text: rescored.text,
+            detected: detectedTerms.isEmpty ? nil : detectedTerms,
+            applied: appliedTerms.isEmpty ? nil : appliedTerms
+        )
+    }
+
+    private func uniquePreservingOrder(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var deduped: [String] = []
+        deduped.reserveCapacity(values.count)
+
+        for value in values where seen.insert(value).inserted {
+            deduped.append(value)
+        }
+
+        return deduped
     }
 
     internal func processTranscriptionResult(
