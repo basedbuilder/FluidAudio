@@ -87,7 +87,8 @@ public struct VocabularyRescorer: Sendable {
         spotter: CtcKeywordSpotter,
         vocabulary: CustomVocabularyContext,
         config: Config = .default,
-        ctcModelDirectory: URL? = nil
+        ctcModelDirectory: URL? = nil,
+        debugMode: Bool? = nil
     ) async throws -> VocabularyRescorer {
         let tokenizer: CtcTokenizer
         if let modelDir = ctcModelDirectory {
@@ -106,7 +107,8 @@ public struct VocabularyRescorer: Sendable {
             ctcTokenizer: tokenizer,
             useBKTree: useBKTree,
             bkTree: bkTree,
-            bkTreeMaxDistance: ContextBiasingConstants.bkTreeMaxDistance
+            bkTreeMaxDistance: ContextBiasingConstants.bkTreeMaxDistance,
+            debugMode: debugMode
         )
     }
 
@@ -116,7 +118,8 @@ public struct VocabularyRescorer: Sendable {
     public static func create(
         vocabulary: CustomVocabularyContext,
         config: Config = .default,
-        ctcModelDirectory: URL? = nil
+        ctcModelDirectory: URL? = nil,
+        debugMode: Bool? = nil
     ) async throws -> VocabularyRescorer {
         let tokenizer: CtcTokenizer
         if let modelDir = ctcModelDirectory {
@@ -135,7 +138,8 @@ public struct VocabularyRescorer: Sendable {
             ctcTokenizer: tokenizer,
             useBKTree: useBKTree,
             bkTree: bkTree,
-            bkTreeMaxDistance: ContextBiasingConstants.bkTreeMaxDistance
+            bkTreeMaxDistance: ContextBiasingConstants.bkTreeMaxDistance,
+            debugMode: debugMode
         )
     }
 
@@ -147,7 +151,8 @@ public struct VocabularyRescorer: Sendable {
         ctcTokenizer: CtcTokenizer,
         useBKTree: Bool,
         bkTree: BKTree?,
-        bkTreeMaxDistance: Int
+        bkTreeMaxDistance: Int,
+        debugMode: Bool?
     ) {
         self.spotter = spotter
         self.vocabulary = vocabulary
@@ -156,11 +161,7 @@ public struct VocabularyRescorer: Sendable {
         self.useBKTree = useBKTree
         self.bkTree = bkTree
         self.bkTreeMaxDistance = bkTreeMaxDistance
-        #if DEBUG
-        self.debugMode = true  // Verbose logging in DEBUG builds
-        #else
-        self.debugMode = false
-        #endif
+        self.debugMode = debugMode ?? CustomVocabularyDebugSettings.verboseLoggingEnabled()
     }
 
     // MARK: - Result Types
