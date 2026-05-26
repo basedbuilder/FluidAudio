@@ -13,6 +13,7 @@ public actor AsrManager {
     internal var encoderModel: MLModel?
     internal var decoderModel: MLModel?
     internal var jointModel: MLModel?
+    internal var retainedCtcHeadEncoderOutput: MLMultiArray?
 
     /// The AsrModels instance if initialized with models
     internal var asrModels: AsrModels?
@@ -191,6 +192,7 @@ public actor AsrManager {
         encoderModel = nil
         decoderModel = nil
         jointModel = nil
+        retainedCtcHeadEncoderOutput = nil
         Task { await sharedMLArrayCache.clear() }
         logger.info("AsrManager resources cleaned up")
     }
@@ -459,12 +461,54 @@ public actor AsrManager {
         decoderState: inout TdtDecoderState,
         language: Language? = nil
     ) async throws -> ASRResult {
+        try await transcribeRawSamples(
+            audioSamples,
+            decoderState: &decoderState,
+            language: language,
+            customVocabulary: nil,
+            vocabularyRescorer: nil
+        )
+    }
+
+    /// Transcribe raw float samples and rescore custom vocabulary using the model's CTC head.
+    ///
+    /// This overload is available for hybrid TDT+CTC models. It reuses CTC logits
+    /// from the ASR model instead of running a separate CTC keyword-spotting model.
+    public func transcribe(
+        _ audioSamples: [Float],
+        decoderState: inout TdtDecoderState,
+        language: Language? = nil,
+        customVocabulary: CustomVocabularyContext,
+        vocabularyRescorer: VocabularyRescorer
+    ) async throws -> ASRResult {
+        try await transcribeRawSamples(
+            audioSamples,
+            decoderState: &decoderState,
+            language: language,
+            customVocabulary: customVocabulary,
+            vocabularyRescorer: vocabularyRescorer
+        )
+    }
+
+    private func transcribeRawSamples(
+        _ audioSamples: [Float],
+        decoderState: inout TdtDecoderState,
+        language: Language?,
+        customVocabulary: CustomVocabularyContext?,
+        vocabularyRescorer: VocabularyRescorer?
+    ) async throws -> ASRResult {
         let shouldEmitProgress = audioSamples.count > ASRConstants.maxModelSamples
         if shouldEmitProgress {
             _ = await progressEmitter.ensureSession()
         }
         do {
-            let result = try await transcribeWithState(audioSamples, decoderState: &decoderState, language: language)
+            let result = try await transcribeWithState(
+                audioSamples,
+                decoderState: &decoderState,
+                language: language,
+                customVocabulary: customVocabulary,
+                vocabularyRescorer: vocabularyRescorer
+            )
 
             if shouldEmitProgress {
                 await progressEmitter.finishSession()

@@ -13,7 +13,7 @@ public struct VocabularyRescorer: Sendable {
 
     let logger = AppLogger(category: "VocabularyRescorer")
 
-    let spotter: CtcKeywordSpotter
+    let spotter: CtcKeywordSpotter?
     let vocabulary: CustomVocabularyContext
     let ctcTokenizer: CtcTokenizer?
     let debugMode: Bool
@@ -110,9 +110,38 @@ public struct VocabularyRescorer: Sendable {
         )
     }
 
+    /// Create a rescorer for callers that provide CTC log probabilities directly.
+    ///
+    /// Use this with hybrid TDT+CTC ASR paths where the CTC head has already run.
+    public static func create(
+        vocabulary: CustomVocabularyContext,
+        config: Config = .default,
+        ctcModelDirectory: URL? = nil
+    ) async throws -> VocabularyRescorer {
+        let tokenizer: CtcTokenizer
+        if let modelDir = ctcModelDirectory {
+            tokenizer = try await CtcTokenizer.load(from: modelDir)
+        } else {
+            tokenizer = try await CtcTokenizer.load()
+        }
+
+        let useBKTree = ContextBiasingConstants.useBkTree
+        let bkTree: BKTree? = useBKTree ? BKTree(terms: vocabulary.terms) : nil
+
+        return VocabularyRescorer(
+            spotter: nil,
+            vocabulary: vocabulary,
+            config: config,
+            ctcTokenizer: tokenizer,
+            useBKTree: useBKTree,
+            bkTree: bkTree,
+            bkTreeMaxDistance: ContextBiasingConstants.bkTreeMaxDistance
+        )
+    }
+
     /// Private initializer for async factory
     private init(
-        spotter: CtcKeywordSpotter,
+        spotter: CtcKeywordSpotter?,
         vocabulary: CustomVocabularyContext,
         config: Config,
         ctcTokenizer: CtcTokenizer,

@@ -11,8 +11,13 @@ extension AsrManager {
         contextFrameAdjustment: Int = 0,
         isLastChunk: Bool = false,
         globalFrameOffset: Int = 0,
-        language: Language? = nil
-    ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
+        language: Language? = nil,
+        includeCtcHeadLogProbs: Bool = false
+    ) async throws -> (
+        hypothesis: TdtHypothesis,
+        encoderSequenceLength: Int,
+        ctcHeadEncoderOutputRetained: Bool
+    ) {
 
         let preprocessorInput = try await preparePreprocessorInput(
             paddedAudio, actualLength: originalLength)
@@ -56,6 +61,7 @@ extension AsrManager {
                 errorMessage: "Invalid encoder output length")
 
             let encoderSequenceLength = encoderLength[0].intValue
+            retainedCtcHeadEncoderOutput = includeCtcHeadLogProbs ? rawEncoderOutput : nil
 
             // Calculate actual audio frames if not provided using shared constants
             let actualFrames =
@@ -77,13 +83,46 @@ extension AsrManager {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)
             }
 
-            return (hypothesis, encoderSequenceLength)
+            return (hypothesis, encoderSequenceLength, includeCtcHeadLogProbs)
         } catch {
             if let preprocessorAudioArray {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)
             }
             throw error
         }
+    }
+
+    internal func computeCtcHeadLogProbs(
+        encoderOutput: MLMultiArray,
+        audioSampleCount: Int
+    ) async throws -> CtcKeywordSpotter.CtcLogProbResult {
+        guard let models = asrModels else {
+            throw ASRError.notInitialized
+        }
+        guard models.version == .tdtCtc110m else {
+            throw ASRError.processingFailed("CTC-head rescoring requires TDT-CTC-110M")
+        }
+        guard let ctcHead = models.ctcHead else {
+            throw ASRError.processingFailed("CTC-head model unavailable for TDT-CTC-110M")
+        }
+
+        let ctcInput = try MLDictionaryFeatureProvider(dictionary: [
+            "encoder_output": MLFeatureValue(multiArray: encoderOutput)
+        ])
+        let ctcOutput = try await ctcHead.compatPrediction(
+            from: ctcInput,
+            options: predictionOptions
+        )
+        guard let logits = ctcOutput.featureValue(for: "ctc_logits")?.multiArrayValue else {
+            let outputs = ctcOutput.featureNames.sorted().joined(separator: ", ")
+            throw ASRError.processingFailed("Missing ctc_logits from CTC head output. Available outputs: \(outputs)")
+        }
+
+        return try CtcKeywordSpotter.logProbResult(
+            from: logits,
+            audioSampleCount: audioSampleCount,
+            blankId: models.version.blankId
+        )
     }
 
     private func prepareEncoderInput(

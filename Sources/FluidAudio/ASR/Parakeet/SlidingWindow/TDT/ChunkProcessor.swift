@@ -264,7 +264,7 @@ struct ChunkProcessor {
         // Context frame adjustment tells decoder to skip the prepended context frames
         let contextFrames = contextSamples / ASRConstants.samplesPerEncoderFrame
 
-        let (hypothesis, encoderSequenceLength) = try await manager.executeMLInferenceWithTimings(
+        let (hypothesis, encoderSequenceLength, _) = try await manager.executeMLInferenceWithTimings(
             paddedChunk,
             originalLength: samples.count,  // Full length including context
             actualAudioFrames: actualFrameCount,  // Only actual audio frames (excluding context)

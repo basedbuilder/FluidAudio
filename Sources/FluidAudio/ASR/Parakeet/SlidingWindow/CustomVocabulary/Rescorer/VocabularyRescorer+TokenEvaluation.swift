@@ -42,7 +42,7 @@ extension VocabularyRescorer {
         let searchEnd = min(logProbs.count, spanEndFrame + marginFrames)
 
         // Score vocabulary term using constrained CTC
-        let (vocabCtcScore, _, _) = spotter.ctcWordSpotConstrained(
+        let (vocabCtcScore, _, _) = CtcDPAlgorithm.ctcWordSpotConstrained(
             logProbs: logProbs,
             keywordTokens: candidate.vocabTokens,
             searchStartFrame: searchStart,
@@ -73,7 +73,7 @@ extension VocabularyRescorer {
             )
         }
 
-        let (originalCtcScore, _, _) = spotter.ctcWordSpotConstrained(
+        let (originalCtcScore, _, _) = CtcDPAlgorithm.ctcWordSpotConstrained(
             logProbs: logProbs,
             keywordTokens: originalTokens,
             searchStartFrame: searchStart,

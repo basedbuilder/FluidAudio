@@ -125,6 +125,53 @@ extension VocabularyRescorer {
 
     // MARK: - Public API
 
+    /// Return whether the transcript has a plausible vocabulary span worth CTC scoring.
+    ///
+    /// This is intentionally a conservative preflight: false means CTC rescoring
+    /// would only skip exact matches or low-similarity spans.
+    public func hasPotentialCtcTokenRescoreCandidate(
+        transcript: String,
+        tokenTimings: [TokenTiming],
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+    ) -> Bool {
+        let wordTimings = buildWordTimings(from: tokenTimings)
+        guard !wordTimings.isEmpty else { return false }
+
+        for term in vocabulary.terms {
+            let vocabTerm = term.text
+            guard vocabTerm.count >= vocabulary.minTermLength else { continue }
+            guard let vocabTokens = term.ctcTokenIds ?? term.tokenIds, !vocabTokens.isEmpty else { continue }
+
+            let normalizedForms = buildNormalizedForms(for: term)
+            guard !normalizedForms.isEmpty else { continue }
+
+            let normalizedCanonical = Self.normalizeForSimilarity(vocabTerm)
+            let multiWordForms = normalizedForms.filter { $0.wordCount > 1 }
+            let singleWordForms = normalizedForms.filter { $0.wordCount == 1 }
+
+            if hasPotentialMultiWordCandidate(
+                wordTimings: wordTimings,
+                forms: multiWordForms,
+                normalizedCanonical: normalizedCanonical,
+                minSimilarity: minSimilarity
+            ) {
+                return true
+            }
+
+            if hasPotentialSingleWordCandidate(
+                wordTimings: wordTimings,
+                forms: singleWordForms,
+                vocabTerm: vocabTerm,
+                normalizedCanonical: normalizedCanonical,
+                minSimilarity: minSimilarity
+            ) {
+                return true
+            }
+        }
+
+        return false
+    }
+
     /// Rescore using constrained CTC token scoring around TDT word locations.
     ///
     /// Dispatches to either word-centric (BK-tree enabled) or term-centric (default) algorithm.
@@ -169,6 +216,128 @@ extension VocabularyRescorer {
                 minSimilarity: minSimilarity
             )
         }
+    }
+
+    private func hasPotentialMultiWordCandidate(
+        wordTimings: [WordTiming],
+        forms: [NormalizedForm],
+        normalizedCanonical: String,
+        minSimilarity: Float
+    ) -> Bool {
+        guard !forms.isEmpty else { return false }
+
+        let maxWordCount = forms.map(\.wordCount).max() ?? 0
+        let minWordCount = forms.map(\.wordCount).min() ?? 0
+        let maxSpan = min(4, maxWordCount + 1)
+        let minSpan = max(2, minWordCount)
+        guard minSpan <= maxSpan else { return false }
+
+        for spanLength in minSpan...maxSpan {
+            guard spanLength <= wordTimings.count else { break }
+            let minSimilarityForSpan = requiredSimilarity(minSimilarity: minSimilarity, spanLength: spanLength)
+            for startIdx in 0..<(wordTimings.count - spanLength + 1) {
+                let phrase = (startIdx..<(startIdx + spanLength))
+                    .map { wordTimings[$0].word }
+                    .joined(separator: " ")
+                let normalizedPhrase = Self.normalizeForSimilarity(phrase)
+                guard !normalizedPhrase.isEmpty, normalizedPhrase != normalizedCanonical else { continue }
+
+                if forms.contains(where: { Self.stringSimilarity(normalizedPhrase, $0.normalized) >= minSimilarityForSpan }) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    private func hasPotentialSingleWordCandidate(
+        wordTimings: [WordTiming],
+        forms: [NormalizedForm],
+        vocabTerm: String,
+        normalizedCanonical: String,
+        minSimilarity: Float
+    ) -> Bool {
+        guard !forms.isEmpty else { return false }
+
+        for wordIdx in wordTimings.indices {
+            let normalizedWord = Self.normalizeForSimilarity(wordTimings[wordIdx].word)
+            guard !normalizedWord.isEmpty, normalizedWord != normalizedCanonical else { continue }
+
+            var bestSimilarity: Float = 0
+            var matchedSpanLength = 1
+            for form in forms {
+                bestSimilarity = max(bestSimilarity, Self.stringSimilarity(normalizedWord, form.normalized))
+            }
+
+            let normalized2: String? =
+                wordIdx + 1 < wordTimings.count
+                ? Self.normalizeForSimilarity(wordTimings[wordIdx + 1].word)
+                : nil
+            let normalized3: String? =
+                wordIdx + 2 < wordTimings.count
+                ? Self.normalizeForSimilarity(wordTimings[wordIdx + 2].word)
+                : nil
+
+            if let normalized2, !normalized2.isEmpty, vocabTerm.count >= 4 {
+                let normalized2MatchesVocab = forms.contains {
+                    Self.stringSimilarity(normalized2, $0.normalized) >= 0.9
+                }
+                if !normalized2MatchesVocab {
+                    let concatenated = normalizedWord + normalized2
+                    for form in forms where Self.stringSimilarity(concatenated, form.normalized) > bestSimilarity {
+                        bestSimilarity = Self.stringSimilarity(concatenated, form.normalized)
+                        matchedSpanLength = 2
+                    }
+                }
+            }
+
+            if let normalized2, let normalized3, !normalized2.isEmpty, !normalized3.isEmpty, vocabTerm.count >= 8 {
+                let laterWordMatchesVocab = forms.contains {
+                    Self.stringSimilarity(normalized2, $0.normalized) >= 0.9
+                        || Self.stringSimilarity(normalized3, $0.normalized) >= 0.9
+                }
+                if !laterWordMatchesVocab {
+                    let concatenated = normalizedWord + normalized2 + normalized3
+                    for form in forms where Self.stringSimilarity(concatenated, form.normalized) > bestSimilarity {
+                        bestSimilarity = Self.stringSimilarity(concatenated, form.normalized)
+                        matchedSpanLength = 3
+                    }
+                }
+            }
+
+            var minSimilarityForSpan = requiredSimilarity(
+                minSimilarity: minSimilarity,
+                spanLength: matchedSpanLength
+            )
+            if matchedSpanLength == 1 {
+                minSimilarityForSpan = checkLengthRatioRules(
+                    normalizedWord: normalizedWord,
+                    vocabTerm: vocabTerm,
+                    currentSimilarity: bestSimilarity,
+                    minSimilarity: minSimilarityForSpan
+                )
+            }
+
+            let spanWords =
+                matchedSpanLength >= 2
+                ? (0..<matchedSpanLength).map { Self.normalizeForSimilarity(wordTimings[wordIdx + $0].word) }
+                : []
+            let (shouldSkipStopword, adjustedSimilarity) = checkStopwordRules(
+                normalizedWord: normalizedWord,
+                spanLength: matchedSpanLength,
+                spanWords: spanWords,
+                vocabTerm: vocabTerm,
+                currentSimilarity: minSimilarityForSpan
+            )
+            guard !shouldSkipStopword else { continue }
+
+            if bestSimilarity >= adjustedSimilarity {
+                return true
+            }
+        }
+
+        return false
     }
 
     // MARK: - Word-Centric Algorithm (Experimental)
