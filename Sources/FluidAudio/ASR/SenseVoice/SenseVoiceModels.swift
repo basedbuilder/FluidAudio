@@ -17,7 +17,7 @@ public enum SenseVoiceEncoderPrecision: String, Sendable {
     }
 
     var computeUnits: MLComputeUnits {
-        self == .fp32 ? .all : .cpuAndNeuralEngine
+        self == .fp32 ? .cpuOnly : .cpuAndNeuralEngine
     }
 }
 
@@ -32,13 +32,38 @@ public struct SenseVoiceModels: Sendable {
     public let preprocessor: MLModel
     public let encoder: MLModel
     public let vocabulary: [Int: String]
+    public let encoderPrecision: SenseVoiceEncoderPrecision
+    let nativePreprocessor: SenseVoiceNativePreprocessor?
 
     private static let logger = AppLogger(category: "SenseVoiceModels")
 
-    public init(preprocessor: MLModel, encoder: MLModel, vocabulary: [Int: String]) {
+    public init(
+        preprocessor: MLModel,
+        encoder: MLModel,
+        vocabulary: [Int: String],
+        encoderPrecision: SenseVoiceEncoderPrecision = .fp16
+    ) {
+        self.init(
+            preprocessor: preprocessor,
+            encoder: encoder,
+            vocabulary: vocabulary,
+            encoderPrecision: encoderPrecision,
+            nativePreprocessor: nil
+        )
+    }
+
+    init(
+        preprocessor: MLModel,
+        encoder: MLModel,
+        vocabulary: [Int: String],
+        encoderPrecision: SenseVoiceEncoderPrecision,
+        nativePreprocessor: SenseVoiceNativePreprocessor?
+    ) {
         self.preprocessor = preprocessor
         self.encoder = encoder
         self.vocabulary = vocabulary
+        self.encoderPrecision = encoderPrecision
+        self.nativePreprocessor = nativePreprocessor
     }
 
     /// Download (if needed) and load all SenseVoice models.
@@ -107,9 +132,18 @@ public struct SenseVoiceModels: Sendable {
             named: ModelNames.SenseVoice.preprocessor, from: directory, configuration: cpuConfig)
         let encoder = try loadModel(named: precision.modelName, from: directory, configuration: encoderConfig)
         let vocabulary = try loadVocabulary(from: directory)
+        let nativePreprocessor = try SenseVoiceNativePreprocessor.load(
+            from: directory.appendingPathComponent(ModelNames.SenseVoice.preprocessorFile)
+        )
 
         logger.info("Loaded SenseVoice (encoder: \(precision.rawValue), vocab: \(vocabulary.count))")
-        return SenseVoiceModels(preprocessor: preprocessor, encoder: encoder, vocabulary: vocabulary)
+        return SenseVoiceModels(
+            preprocessor: preprocessor,
+            encoder: encoder,
+            vocabulary: vocabulary,
+            encoderPrecision: precision,
+            nativePreprocessor: nativePreprocessor
+        )
     }
 
     // MARK: - Private

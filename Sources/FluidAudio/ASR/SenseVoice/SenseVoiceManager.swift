@@ -36,27 +36,38 @@ public actor SenseVoiceManager {
 
     /// Transcribe a 16 kHz mono audio file.
     public func transcribe(audioURL: URL) throws -> String {
-        let converter = AudioConverter(sampleRate: Double(SenseVoiceConfig.sampleRate))
-        let samples = try converter.resampleAudioFile(audioURL)
-        return try transcribe(audio: samples)
+        try autoreleasepool {
+            let converter = AudioConverter(sampleRate: Double(SenseVoiceConfig.sampleRate))
+            let samples = try converter.resampleAudioFile(audioURL)
+            return try transcribe(audio: samples)
+        }
     }
 
     /// Transcribe 16 kHz mono float samples (in [-1, 1]).
     public func transcribe(audio: [Float]) throws -> String {
-        let features = try runPreprocessor(audio: audio)
-        let (logits, validFrames) = try runEncoder(features: features)
-        return decode(logits: logits, validFrames: validFrames)
+        try autoreleasepool {
+            let (features, validFeatureFrames) = try runPreprocessor(audio: audio)
+            let (logits, validFrames) = try runEncoder(features: features, validFeatureFrames: validFeatureFrames)
+            return decode(logits: logits, validFrames: validFrames)
+        }
     }
 
     // MARK: - Pipeline
 
     /// waveform [1, N] (scaled to int16 range) → features [1, T, 560].
-    private func runPreprocessor(audio: [Float]) throws -> MLMultiArray {
+    private func runPreprocessor(audio: [Float]) throws -> (MLMultiArray, Int) {
+        if let nativePreprocessor = models.nativePreprocessor {
+            let features = try nativePreprocessor.computeFeatures(audio: audio)
+            return (features, features.shape[1].intValue)
+        }
+
         let n = audio.count
         let waveform = try MLMultiArray(shape: [1, n as NSNumber], dataType: .float32)
         let scale = SenseVoiceConfig.waveformScale
         let wptr = waveform.dataPointer.assumingMemoryBound(to: Float32.self)
-        for i in 0..<n { wptr[i] = audio[i] * scale }
+        let waveformStrides = waveform.strides.map(\.intValue)
+        let sampleStride = waveformStrides.count > 1 ? waveformStrides[1] : 1
+        for i in 0..<n { wptr[i * sampleStride] = audio[i] * scale }
 
         let input = try MLDictionaryFeatureProvider(
             dictionary: ["waveform": MLFeatureValue(multiArray: waveform)])
@@ -64,29 +75,27 @@ public actor SenseVoiceManager {
         guard let features = out.featureValue(for: "features")?.multiArrayValue else {
             throw ASRError.processingFailed("SenseVoice preprocessor produced no `features`")
         }
-        return features
+        return (features, features.shape[1].intValue)
     }
 
     /// features [1, T, 560] → (ctc_logits [1, bucket+4, V], validFrames = 4 + T).
-    private func runEncoder(features: MLMultiArray) throws -> (MLMultiArray, Int) {
+    private func runEncoder(features: MLMultiArray, validFeatureFrames: Int) throws -> (MLMultiArray, Int) {
         let dim = SenseVoiceConfig.featureDim
-        var t = features.shape[1].intValue
+        var t = min(features.shape[1].intValue, validFeatureFrames)
         if t > SenseVoiceConfig.maxFrames {
             Self.logger.warning("Audio exceeds max length; truncating \(t) → \(SenseVoiceConfig.maxFrames) frames")
             t = SenseVoiceConfig.maxFrames
         }
-        let bucket = SenseVoiceConfig.pickBucket(forFrames: t)
+        let bucket =
+            models.encoderPrecision == .fp32
+            ? SenseVoiceConfig.maxFrames
+            : SenseVoiceConfig.pickBucket(forFrames: t)
 
         // Zero-padded [1, bucket, 560] with the first T feature frames copied in.
         let speech = try MLMultiArray(shape: [1, bucket as NSNumber, dim as NSNumber], dataType: .float32)
         let sptr = speech.dataPointer.assumingMemoryBound(to: Float32.self)
         memset(sptr, 0, bucket * dim * MemoryLayout<Float32>.size)
-        let count = t * dim
-        if features.dataType == .float32 {
-            memcpy(sptr, features.dataPointer, count * MemoryLayout<Float32>.size)
-        } else {
-            for i in 0..<count { sptr[i] = features[i].floatValue }
-        }
+        copyFeatures(features, frames: t, dim: dim, to: sptr)
 
         let lengths = try MLMultiArray(shape: [1], dataType: .int32)
         lengths[0] = NSNumber(value: t)
@@ -106,6 +115,40 @@ public actor SenseVoiceManager {
             throw ASRError.processingFailed("SenseVoice encoder produced no `ctc_logits`")
         }
         return (logits, SenseVoiceConfig.numQueryTokens + t)
+    }
+
+    private func copyFeatures(
+        _ features: MLMultiArray,
+        frames: Int,
+        dim: Int,
+        to destination: UnsafeMutablePointer<Float32>
+    ) {
+        let featureStrides = features.strides.map(\.intValue)
+        guard featureStrides.count >= 3 else {
+            for i in 0..<(frames * dim) { destination[i] = features[i].floatValue }
+            return
+        }
+
+        let timeStride = featureStrides[1]
+        let dimStride = featureStrides[2]
+
+        if features.dataType == .float32 {
+            let source = features.dataPointer.assumingMemoryBound(to: Float32.self)
+            for frame in 0..<frames {
+                let sourceBase = frame * timeStride
+                let destBase = frame * dim
+                for d in 0..<dim {
+                    destination[destBase + d] = source[sourceBase + d * dimStride]
+                }
+            }
+        } else {
+            for frame in 0..<frames {
+                let destBase = frame * dim
+                for d in 0..<dim {
+                    destination[destBase + d] = features[[0, frame as NSNumber, d as NSNumber]].floatValue
+                }
+            }
+        }
     }
 
     /// Greedy CTC over the first `validFrames` (drop blank 0, collapse repeats),
@@ -130,11 +173,21 @@ public actor SenseVoiceManager {
             prev = best
         }
 
+        let logitStrides = logits.strides.map(\.intValue)
+        let timeStride = logitStrides.count > 1 ? logitStrides[1] : vocab
+        let vocabStride = logitStrides.count > 2 ? logitStrides[2] : 1
+
         if logits.dataType == .float32 {
             let p = logits.dataPointer.assumingMemoryBound(to: Float32.self)
             for t in 0..<frames {
-                let base = t * vocab
-                appendArgmax { p[base + $0] }
+                let base = t * timeStride
+                appendArgmax { p[base + $0 * vocabStride] }
+            }
+        } else if logits.dataType == .float16 {
+            let p = logits.dataPointer.assumingMemoryBound(to: Float16.self)
+            for t in 0..<frames {
+                let base = t * timeStride
+                appendArgmax { Float(p[base + $0 * vocabStride]) }
             }
         } else {
             for t in 0..<frames {

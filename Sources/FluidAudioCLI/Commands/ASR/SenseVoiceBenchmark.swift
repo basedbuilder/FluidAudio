@@ -52,9 +52,6 @@ enum SenseVoiceBenchmark {
             .appendingPathComponent("Library/Application Support/FluidAudio/FLEURS").path
 
         do {
-            logger.info("Loading SenseVoice (encoder: \(precision.rawValue))...")
-            let manager = try await SenseVoiceManager.load(precision: precision)
-
             let fleurs = FLEURSBenchmark(
                 config: .init(
                     languages: languages, samplesPerLanguage: samplesPerLanguage,
@@ -63,9 +60,16 @@ enum SenseVoiceBenchmark {
             try await fleurs.downloadFLEURS(languages: languages)
             let allSamples = try fleurs.loadFLEURSSamples(languages: languages)
 
-            let converter = AudioConverter(sampleRate: 16_000)
+            logger.info("Loading SenseVoice (encoder: \(precision.rawValue))...")
+            let models = try await SenseVoiceModels.downloadAndLoad(precision: precision)
+
             for language in languages {
-                let samples = allSamples.filter { $0.language == language }.prefix(samplesPerLanguage)
+                let manager = SenseVoiceManager(
+                    models: models,
+                    language: SenseVoiceConfig.fleursLanguageEmbeddings[language] ?? SenseVoiceConfig.defaultLanguage
+                )
+                let languageSamples = allSamples.filter { $0.language == language }
+                let samples = languageSamples.prefix(samplesPerLanguage)
                 var wordErrors = 0
                 var totalWords = 0
                 var charErrors = 0.0
@@ -74,11 +78,16 @@ enum SenseVoiceBenchmark {
                 var procSec = 0.0
                 var n = 0
                 for sample in samples {
-                    guard let audio = try? converter.resampleAudioFile(path: sample.audioPath) else { continue }
+                    let audioURL = URL(fileURLWithPath: sample.audioPath)
                     let t0 = Date()
-                    guard let hyp = try? await manager.transcribe(audio: audio) else { continue }
+                    guard let hyp = try? await manager.transcribe(audioURL: audioURL) else { continue }
                     procSec += Date().timeIntervalSince(t0)
-                    audioSec += Double(audio.count) / 16_000.0
+                    if
+                        let audioFile = try? AVAudioFile(forReading: audioURL),
+                        audioFile.processingFormat.sampleRate > 0
+                    {
+                        audioSec += Double(audioFile.length) / audioFile.processingFormat.sampleRate
+                    }
                     let m = WERCalculator.calculateWERAndCER(hypothesis: hyp, reference: sample.transcription)
                     wordErrors += m.insertions + m.deletions + m.substitutions
                     totalWords += m.totalWords
@@ -89,6 +98,9 @@ enum SenseVoiceBenchmark {
                 let wer = totalWords > 0 ? 100.0 * Double(wordErrors) / Double(totalWords) : 0
                 let cer = totalChars > 0 ? 100.0 * charErrors / Double(totalChars) : 0
                 let rtfx = procSec > 0 ? audioSec / procSec : 0
+                print(
+                    "[\(language)] n=\(n)  WER=\(String(format: "%.2f", wer))%  CER=\(String(format: "%.2f", cer))%  RTFx=\(String(format: "%.0f", rtfx))"
+                )
                 logger.info(
                     "[\(language)] n=\(n)  WER=\(String(format: "%.2f", wer))%  CER=\(String(format: "%.2f", cer))%  RTFx=\(String(format: "%.0f", rtfx))"
                 )

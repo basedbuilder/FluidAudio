@@ -27,6 +27,38 @@ public enum SenseVoiceConfig {
     /// Default text-norm embed index (`15` = woitn, no inverse text-norm).
     public static let defaultTextNorm: Int32 = 15
 
+    public static let languageEmbeddings: [String: Int32] = [
+        "zh": 3,
+        "en": 4,
+        "yue": 7,
+        "ja": 11,
+        "ko": 12,
+        "nospeech": 13,
+    ]
+
+    public static let fleursLanguageEmbeddings: [String: Int32] = [
+        "cmn_hans_cn": 3,
+        "en_us": 4,
+        "yue_hant_hk": 7,
+        "ja_jp": 11,
+        "ko_kr": 12,
+    ]
+
+    public static func languageEmbedding(for code: String) -> Int32? {
+        let normalized = code.lowercased().replacingOccurrences(of: "-", with: "_")
+        if normalized == "auto" { return defaultLanguage }
+        if let embedding = languageEmbeddings[normalized] { return embedding }
+        if let embedding = fleursLanguageEmbeddings[normalized] { return embedding }
+        switch normalized {
+        case "eng", "english": return languageEmbeddings["en"]
+        case "chinese", "mandarin": return languageEmbeddings["zh"]
+        case "cantonese": return languageEmbeddings["yue"]
+        case "japanese": return languageEmbeddings["ja"]
+        case "korean": return languageEmbeddings["ko"]
+        default: return nil
+        }
+    }
+
     public static let sampleRate = 16_000
 
     /// Kaldi feeds waveforms in int16 range; AudioConverter yields [-1, 1], so
