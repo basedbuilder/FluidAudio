@@ -14,8 +14,8 @@ final class ManifestDownloadRunnerTests: XCTestCase {
         let tempDir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        DownloadTestURLProtocol.enqueue(statusCode: 200, chunks: [Data("abcd".utf8)])
-        DownloadTestURLProtocol.enqueue(statusCode: 200, chunks: [Data("efghij".utf8)])
+        DownloadTestURLProtocol.enqueue(path: "a.bin", statusCode: 200, chunks: [Data("abcd".utf8)])
+        DownloadTestURLProtocol.enqueue(path: "b.bin", statusCode: 200, chunks: [Data("efghij".utf8)])
 
         let unitA = ManifestDownloadUnit(
             manifest: DownloadManifest(files: [
@@ -58,11 +58,13 @@ final class ManifestDownloadRunnerTests: XCTestCase {
         try Data("ab".utf8).write(to: partial)
 
         DownloadTestURLProtocol.enqueue(
+            path: "partial.bin",
             statusCode: 206,
             headers: ["Content-Range": "bytes 2-4/5"],
             chunks: [Data("cde".utf8)]
         )
         DownloadTestURLProtocol.enqueue(
+            path: "missing.bin",
             statusCode: 200,
             chunks: [Data("xyz".utf8)]
         )
@@ -96,15 +98,19 @@ final class ManifestDownloadRunnerTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: partialDestination), Data("abcde".utf8))
         XCTAssertEqual(try Data(contentsOf: tempDir.appendingPathComponent("missing.bin")), Data("xyz".utf8))
         XCTAssertTrue(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("empty.bin").path))
-        XCTAssertEqual(DownloadTestURLProtocol.requests.first?.value(forHTTPHeaderField: "Range"), "bytes=2-")
+        XCTAssertTrue(
+            DownloadTestURLProtocol.requests.contains {
+                $0.value(forHTTPHeaderField: "Range") == "bytes=2-"
+            }
+        )
     }
 
     func testUnknownSizeKeepsByteFractionNilUntilComplete() async throws {
         let tempDir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        DownloadTestURLProtocol.enqueue(statusCode: 200, chunks: [Data("abc".utf8)])
-        DownloadTestURLProtocol.enqueue(statusCode: 200, chunks: [Data("defg".utf8)])
+        DownloadTestURLProtocol.enqueue(path: "known.bin", statusCode: 200, chunks: [Data("abc".utf8)])
+        DownloadTestURLProtocol.enqueue(path: "unknown.bin", statusCode: 200, chunks: [Data("defg".utf8)])
 
         let unit = ManifestDownloadUnit(
             manifest: DownloadManifest(files: [
@@ -194,6 +200,41 @@ final class ManifestDownloadRunnerTests: XCTestCase {
         XCTAssertEqual(recordedSamples.last?.downloadFractionCompleted, 1.0)
     }
 
+    func testIndependentFilesRespectGlobalConcurrencyCap() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let counter = ActiveDownloadCounter()
+        let fileCount = 10
+
+        let unit = ManifestDownloadUnit(
+            manifest: DownloadManifest(files: (0..<fileCount).map { index in
+                DownloadFile(
+                    remotePath: "file-\(index).bin",
+                    localRelativePath: "file-\(index).bin",
+                    sizeBytes: 1024
+                )
+            }),
+            destinationRoot: tempDir,
+            makeRequest: { file in URLRequest(url: URL(string: "https://test.local/\(file.remotePath)")!) }
+        )
+
+        try await ManifestDownloadRunner(downloadFile: { _, destinationURL, expectedBytes, progress in
+            counter.begin()
+            defer { counter.end() }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            let bytes = expectedBytes ?? 1024
+            progress(bytes)
+            return ValidatedDownloadResult(finalURL: destinationURL, bytesWritten: bytes, resumed: false)
+        }).run(
+            units: [unit],
+            legacyFractionMultiplier: 1.0
+        ) { _ in }
+
+        XCTAssertGreaterThanOrEqual(counter.maxActive, 2)
+        XCTAssertLessThanOrEqual(counter.maxActive, 6)
+    }
+
     func testExistingProgressInitializerRemainsSourceCompatible() {
         let progress = DownloadUtils.DownloadProgress(
             fractionCompleted: 0.25,
@@ -248,25 +289,31 @@ final class DownloadTestURLProtocol: URLProtocol {
     }
 
     static func enqueue(
+        path: String? = nil,
         statusCode: Int,
         headers: [String: String] = [:],
         chunks: [Data] = [],
         errorAfterChunks: Error? = nil
     ) {
+        let response = DownloadTestResponse(
+            statusCode: statusCode,
+            headers: headers,
+            chunks: chunks,
+            errorAfterChunks: errorAfterChunks
+        )
         state.withLock { state in
-            state.queuedResponses.append(
-                DownloadTestResponse(
-                    statusCode: statusCode,
-                    headers: headers,
-                    chunks: chunks,
-                    errorAfterChunks: errorAfterChunks
-                ))
+            if let path {
+                state.responsesByPath[path] = response
+            } else {
+                state.queuedResponses.append(response)
+            }
         }
     }
 
     static func reset() {
         state.withLock { state in
             state.queuedResponses = []
+            state.responsesByPath = [:]
             state.capturedRequests = []
         }
     }
@@ -284,6 +331,11 @@ final class DownloadTestURLProtocol: URLProtocol {
         let response: DownloadTestResponse
         response = Self.state.withLock { state in
             state.capturedRequests.append(request)
+            if let key = request.url?.lastPathComponent,
+                let response = state.responsesByPath.removeValue(forKey: key)
+            {
+                return response
+            }
             return state.queuedResponses.removeFirst()
         }
 
@@ -312,5 +364,32 @@ final class DownloadTestURLProtocol: URLProtocol {
 
 private struct DownloadTestURLProtocolState {
     var queuedResponses: [DownloadTestResponse] = []
+    var responsesByPath: [String: DownloadTestResponse] = [:]
     var capturedRequests: [URLRequest] = []
+}
+
+private final class ActiveDownloadCounter: Sendable {
+    private struct State {
+        var active = 0
+        var maxActive = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var maxActive: Int {
+        state.withLock { $0.maxActive }
+    }
+
+    func begin() {
+        state.withLock { state in
+            state.active += 1
+            state.maxActive = max(state.maxActive, state.active)
+        }
+    }
+
+    func end() {
+        state.withLock { state in
+            state.active -= 1
+        }
+    }
 }

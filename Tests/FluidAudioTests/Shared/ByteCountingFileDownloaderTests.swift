@@ -45,6 +45,79 @@ final class ByteCountingFileDownloaderTests: XCTestCase {
         XCTAssertEqual(recordedSamples.last, totalBytes)
     }
 
+    func testLargeFileDoesNotWaitFor16MBSegmentBeforeProgress() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let destination = tempDir.appendingPathComponent("large-file.bin")
+        let chunkSize = 1_048_576
+        let chunkCount = 65
+        let body = Data(repeating: 9, count: chunkSize * chunkCount)
+        let totalBytes = Int64(body.count)
+        let server = try RangeAwareHTTPTestServer(body: body, chunkSize: chunkSize)
+        defer { server.stop() }
+
+        let samples = Int64ProgressRecorder()
+        let result = try await makePlainDownloader().download(
+            request: URLRequest(url: server.url),
+            to: destination,
+            expectedBytes: totalBytes,
+            progress: { samples.append($0) }
+        )
+        let recordedSamples = samples.values
+
+        XCTAssertEqual(result.bytesWritten, totalBytes)
+        XCTAssertEqual(try ByteCountingFileDownloader.fileSize(at: destination), totalBytes)
+        XCTAssertTrue(server.observedRangeHeaders.contains("bytes=0-16777215"))
+        XCTAssertTrue(
+            recordedSamples.contains { $0 > 0 && $0 < 16 * 1_048_576 },
+            "expected progress before a 16 MB segment boundary, got \(recordedSamples.prefix(8))"
+        )
+        XCTAssertEqual(recordedSamples.last, totalBytes)
+    }
+
+    func testParallelRangeFallbackKeepsProgressMonotonicAndResetsToFullDownload() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let destination = tempDir.appendingPathComponent("large-file.bin")
+        let chunkSize = 1_048_576
+        let chunkCount = 65
+        let body = Data(repeating: 6, count: chunkSize * chunkCount)
+        let totalBytes = Int64(body.count)
+        let server = try RangeAwareHTTPTestServer(
+            body: body,
+            chunkSize: chunkSize,
+            failingRangeStarts: [16 * 1_048_576],
+            failureDelayMilliseconds: 80
+        )
+        defer { server.stop() }
+
+        let samples = Int64ProgressRecorder()
+        let result = try await makePlainDownloader().download(
+            request: URLRequest(url: server.url),
+            to: destination,
+            expectedBytes: totalBytes,
+            progress: { samples.append($0) }
+        )
+        let recordedSamples = samples.values
+
+        XCTAssertEqual(result.bytesWritten, totalBytes)
+        XCTAssertEqual(try Data(contentsOf: destination), body)
+        XCTAssertTrue(server.observedRangeHeaders.contains("bytes=0-16777215"))
+        XCTAssertTrue(server.observedRangeHeaders.contains("bytes=16777216-33554431"))
+        XCTAssertTrue(server.observedRangeHeaders.contains(nil))
+        XCTAssertTrue(
+            isNonDecreasing(recordedSamples),
+            "expected monotonic progress, got \(recordedSamples)"
+        )
+        XCTAssertTrue(
+            recordedSamples.contains { $0 > 0 && $0 < totalBytes },
+            "expected intermediate progress, got \(recordedSamples)"
+        )
+        XCTAssertEqual(recordedSamples.last, totalBytes)
+    }
+
     func testResumesPartialFileWithRangeRequest() async throws {
         let tempDir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -74,36 +147,40 @@ final class ByteCountingFileDownloaderTests: XCTestCase {
         XCTAssertEqual(recordedSamples.last, 6)
     }
 
-    func testLiveHuggingFaceRangeEmitsProgressWhenEnabled() async throws {
+    func testLiveHuggingFaceFullFileReportsThroughputWhenEnabled() async throws {
         guard ProcessInfo.processInfo.environment["FLUIDAUDIO_LIVE_DOWNLOAD_SMOKE"] == "1" else {
-            throw XCTSkip("set FLUIDAUDIO_LIVE_DOWNLOAD_SMOKE=1 to run the live Hugging Face smoke test")
+            throw XCTSkip(
+                "set FLUIDAUDIO_LIVE_DOWNLOAD_SMOKE=1 to run the live Hugging Face full-file smoke test"
+            )
         }
 
         let tempDir = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let expectedBytes: Int64 = 52_428_800
-        let destination = tempDir.appendingPathComponent("weight-range.bin")
+        let expectedBytes: Int64 = 215_951_360
+        let destination = tempDir.appendingPathComponent("weight-segmented.bin")
         let url = URL(
             string:
                 "https://huggingface.co/FluidInference/parakeet-tdt-ctc-110m-coreml/resolve/main/Preprocessor.mlmodelc/weights/weight.bin"
         )!
-        var request = URLRequest(url: url, timeoutInterval: 30)
-        request.setValue("bytes=0-52428799", forHTTPHeaderField: "Range")
 
         let samples = Int64ProgressRecorder()
+        let start = Date()
         let result = try await ByteCountingFileDownloader().download(
-            request: request,
+            request: URLRequest(url: url, timeoutInterval: 120),
             to: destination,
             expectedBytes: expectedBytes,
             progress: { samples.append($0) }
         )
-        let recordedSamples = samples.values
+        let elapsed = Date().timeIntervalSince(start)
+        let megabitsPerSecond = (Double(expectedBytes) * 8.0 / 1_000_000.0) / elapsed
+        print(
+            "FLUIDAUDIO_LIVE_DOWNLOAD_SMOKE bytes=\(expectedBytes) elapsed_s=\(elapsed) mbit_s=\(megabitsPerSecond)"
+        )
 
         XCTAssertEqual(result.bytesWritten, expectedBytes)
         XCTAssertEqual(try ByteCountingFileDownloader.fileSize(at: destination), expectedBytes)
-        XCTAssertGreaterThanOrEqual(recordedSamples.filter { $0 > 0 && $0 < expectedBytes }.count, 3)
-        XCTAssertEqual(recordedSamples.last, expectedBytes)
+        XCTAssertGreaterThanOrEqual(samples.values.filter { $0 > 0 && $0 < expectedBytes }.count, 4)
     }
 
     func testRestartsWhenServerIgnoresRangeRequest() async throws {
@@ -398,6 +475,16 @@ final class ByteCountingFileDownloaderTests: XCTestCase {
         }
         return try ByteCountingFileDownloader.fileSize(at: url)
     }
+
+    private func isNonDecreasing(_ values: [Int64]) -> Bool {
+        guard values.count > 1 else { return true }
+        for index in 1..<values.count {
+            if values[index] < values[index - 1] {
+                return false
+            }
+        }
+        return true
+    }
 }
 
 final class ChunkedHTTPTestServer: Sendable {
@@ -487,6 +574,168 @@ final class ChunkedHTTPTestServer: Sendable {
             completion: .contentProcessed { [self] _ in
                 queue.asyncAfter(deadline: .now() + .milliseconds(25)) {
                     self.sendChunk(at: index + 1, on: connection)
+                }
+            })
+    }
+}
+
+final class RangeAwareHTTPTestServer: Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "RangeAwareHTTPTestServer")
+    private let body: Data
+    private let chunkSize: Int
+    private let failingRangeStarts: Set<Int>
+    private let failureDelayMilliseconds: Int
+    private let firstRangeHeaderStorage = OSAllocatedUnfairLock<String?>(initialState: nil)
+    private let rangeHeaderStorage = OSAllocatedUnfairLock<[String?]>(initialState: [])
+
+    var url: URL {
+        URL(string: "http://127.0.0.1:\(listener.port!.rawValue)/large-file.bin")!
+    }
+
+    var firstRangeHeader: String? {
+        firstRangeHeaderStorage.withLock { $0 }
+    }
+
+    var observedRangeHeaders: [String?] {
+        rangeHeaderStorage.withLock { $0 }
+    }
+
+    init(
+        body: Data,
+        chunkSize: Int,
+        failingRangeStarts: Set<Int> = [],
+        failureDelayMilliseconds: Int = 0
+    ) throws {
+        self.listener = try NWListener(using: .tcp, on: .any)
+        self.body = body
+        self.chunkSize = chunkSize
+        self.failingRangeStarts = failingRangeStarts
+        self.failureDelayMilliseconds = failureDelayMilliseconds
+
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state {
+                ready.signal()
+            }
+        }
+        listener.newConnectionHandler = { [self] connection in
+            handle(connection: connection)
+        }
+        listener.start(queue: queue)
+        _ = ready.wait(timeout: .now() + 2)
+    }
+
+    func stop() {
+        listener.cancel()
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    private func handle(connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [self] data, _, _, _ in
+            let rangeHeader = parseRangeHeader(from: data ?? Data())
+            firstRangeHeaderStorage.withLock { stored in
+                if stored == nil {
+                    stored = rangeHeader
+                }
+            }
+            rangeHeaderStorage.withLock { $0.append(rangeHeader) }
+            sendResponse(on: connection, rangeHeader: rangeHeader)
+        }
+    }
+
+    private func parseRangeHeader(from data: Data) -> String? {
+        guard let request = String(data: data, encoding: .utf8) else { return nil }
+        for line in request.components(separatedBy: "\r\n") {
+            guard line.lowercased().hasPrefix("range:") else { continue }
+            return line.dropFirst("range:".count).trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    private func sendResponse(on connection: NWConnection, rangeHeader: String?) {
+        let requestedRange = parseRange(rangeHeader)
+        let start = requestedRange?.start ?? 0
+        let end = requestedRange?.end ?? body.count - 1
+        if failingRangeStarts.contains(start) {
+            sendFailure(on: connection)
+            return
+        }
+        let statusCode = requestedRange == nil ? 200 : 206
+        let responseBody = body.subdata(in: start..<(end + 1))
+        var headers = [
+            "Content-Length": "\(responseBody.count)",
+            "Connection": "close",
+        ]
+        if statusCode == 206 {
+            headers["Content-Range"] = "bytes \(start)-\(end)/\(body.count)"
+        }
+
+        let statusText = HTTPURLResponse.localizedString(forStatusCode: statusCode)
+        var response = "HTTP/1.1 \(statusCode) \(statusText)\r\n"
+        for (key, value) in headers {
+            response += "\(key): \(value)\r\n"
+        }
+        response += "\r\n"
+
+        connection.send(
+            content: Data(response.utf8),
+            completion: .contentProcessed { [self] _ in
+                sendChunk(from: responseBody, offset: 0, on: connection)
+            })
+    }
+
+    private func sendFailure(on connection: NWConnection) {
+        let response = """
+            HTTP/1.1 500 internal server error\r
+            Content-Length: 0\r
+            Connection: close\r
+            \r
+
+            """
+        let send = {
+            connection.send(
+                content: Data(response.utf8),
+                completion: .contentProcessed { _ in connection.cancel() }
+            )
+        }
+        if failureDelayMilliseconds > 0 {
+            queue.asyncAfter(deadline: .now() + .milliseconds(failureDelayMilliseconds), execute: send)
+        } else {
+            send()
+        }
+    }
+
+    private func parseRange(_ rangeHeader: String?) -> (start: Int, end: Int)? {
+        guard let rangeHeader, rangeHeader.hasPrefix("bytes=") else { return nil }
+        let value = rangeHeader.dropFirst("bytes=".count)
+        let bounds = value.split(separator: "-", maxSplits: 1)
+        guard
+            bounds.count == 2,
+            let start = Int(bounds[0]),
+            let end = Int(bounds[1]),
+            start >= 0,
+            end >= start,
+            end < body.count
+        else {
+            return nil
+        }
+        return (start, end)
+    }
+
+    private func sendChunk(from data: Data, offset: Int, on connection: NWConnection) {
+        guard offset < data.count else {
+            connection.send(content: nil, completion: .contentProcessed { _ in connection.cancel() })
+            return
+        }
+
+        let end = min(offset + chunkSize, data.count)
+        connection.send(
+            content: data.subdata(in: offset..<end),
+            completion: .contentProcessed { [self] _ in
+                queue.asyncAfter(deadline: .now() + .milliseconds(10)) {
+                    self.sendChunk(from: data, offset: end, on: connection)
                 }
             })
     }

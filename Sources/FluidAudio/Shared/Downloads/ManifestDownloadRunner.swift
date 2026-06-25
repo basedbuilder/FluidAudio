@@ -1,10 +1,31 @@
 import Foundation
+import os.lock
 
 struct ManifestDownloadRunner {
-    private let downloader: ByteCountingFileDownloader
+    private static let maxConcurrentDownloads = 6
+
+    typealias FileDownloadOperation = @Sendable (
+        URLRequest,
+        URL,
+        Int64?,
+        @escaping @Sendable (Int64) -> Void
+    ) async throws -> ValidatedDownloadResult
+
+    private let downloadFile: FileDownloadOperation
 
     init(downloader: ByteCountingFileDownloader = ByteCountingFileDownloader()) {
-        self.downloader = downloader
+        self.downloadFile = { request, destinationURL, expectedBytes, progress in
+            try await downloader.download(
+                request: request,
+                to: destinationURL,
+                expectedBytes: expectedBytes,
+                progress: progress
+            )
+        }
+    }
+
+    init(downloadFile: @escaping FileDownloadOperation) {
+        self.downloadFile = downloadFile
     }
 
     func run(
@@ -27,6 +48,7 @@ struct ManifestDownloadRunner {
         var completedFiles = 0
         var completedBytes: Int64 = 0
         var completeDestinations = Set<String>()
+        var pendingEntries: [ManifestDownloadEntry] = []
 
         for entry in entries {
             if let existingBytes = try existingCompleteBytes(file: entry.file, destinationURL: entry.destinationURL) {
@@ -36,16 +58,15 @@ struct ManifestDownloadRunner {
             }
         }
 
-        progress(
-            makeProgress(
-                completedBytes: completedBytes,
-                totalKnownBytes: totalKnownBytes,
-                hasUnknownSizes: hasUnknownSizes,
-                completedFiles: completedFiles,
-                totalFiles: totalFiles,
-                currentFile: nil,
-                legacyFractionMultiplier: legacyFractionMultiplier
-            ))
+        let progressState = ManifestDownloadProgressState(
+            completedFiles: completedFiles,
+            completedBytes: completedBytes,
+            totalKnownBytes: totalKnownBytes,
+            hasUnknownSizes: hasUnknownSizes,
+            totalFiles: totalFiles,
+            legacyFractionMultiplier: legacyFractionMultiplier
+        )
+        progress(progressState.snapshot(currentFile: nil))
 
         for entry in entries {
             guard !completeDestinations.contains(entry.destinationURL.path) else { continue }
@@ -54,53 +75,75 @@ struct ManifestDownloadRunner {
 
             if entry.file.sizeBytes == 0 {
                 FileManager.default.createFile(atPath: entry.destinationURL.path, contents: Data())
-                completedFiles += 1
                 progress(
-                    makeProgress(
-                        completedBytes: completedBytes,
-                        totalKnownBytes: totalKnownBytes,
-                        hasUnknownSizes: hasUnknownSizes,
-                        completedFiles: completedFiles,
-                        totalFiles: totalFiles,
-                        currentFile: entry.file.localRelativePath,
-                        legacyFractionMultiplier: legacyFractionMultiplier
+                    progressState.complete(
+                        fileKey: entry.fileKey,
+                        bytesWritten: 0,
+                        currentFile: entry.file.localRelativePath
                     ))
                 continue
             }
 
-            let request = try entry.unit.makeRequest(entry.file)
-            let baseCompletedBytes = completedBytes
-            let completedFilesBeforeCurrent = completedFiles
-            let result = try await downloader.download(
-                request: request,
-                to: entry.destinationURL,
-                expectedBytes: entry.file.sizeBytes,
-                progress: { fileBytes in
-                    progress(
-                        makeProgress(
-                            completedBytes: baseCompletedBytes + fileBytes,
-                            totalKnownBytes: totalKnownBytes,
-                            hasUnknownSizes: hasUnknownSizes,
-                            completedFiles: completedFilesBeforeCurrent,
-                            totalFiles: totalFiles,
-                            currentFile: entry.file.localRelativePath,
-                            legacyFractionMultiplier: legacyFractionMultiplier
-                        ))
-                }
-            )
+            pendingEntries.append(entry)
+        }
 
-            completedFiles += 1
-            completedBytes = baseCompletedBytes + result.bytesWritten
-            progress(
-                makeProgress(
-                    completedBytes: completedBytes,
-                    totalKnownBytes: totalKnownBytes,
-                    hasUnknownSizes: hasUnknownSizes,
-                    completedFiles: completedFiles,
-                    totalFiles: totalFiles,
-                    currentFile: entry.file.localRelativePath,
-                    legacyFractionMultiplier: legacyFractionMultiplier
-                ))
+        try await downloadPendingEntries(
+            pendingEntries,
+            progressState: progressState,
+            progress: progress
+        )
+    }
+
+    private func downloadPendingEntries(
+        _ entries: [ManifestDownloadEntry],
+        progressState: ManifestDownloadProgressState,
+        progress: @escaping @Sendable (DownloadUtils.DownloadProgress) -> Void
+    ) async throws {
+        guard !entries.isEmpty else { return }
+
+        try await withThrowingTaskGroup(of: ManifestDownloadCompletion.self) { group in
+            var nextIndex = 0
+
+            func scheduleNext() {
+                guard nextIndex < entries.count else { return }
+                let entry = entries[nextIndex]
+                nextIndex += 1
+
+                group.addTask {
+                    let request = try entry.unit.makeRequest(entry.file)
+                    let result = try await downloadFile(
+                        request,
+                        entry.destinationURL,
+                        entry.file.sizeBytes
+                    ) { fileBytes in
+                        progress(
+                            progressState.updateInProgress(
+                                fileKey: entry.fileKey,
+                                bytesWritten: fileBytes,
+                                currentFile: entry.file.localRelativePath
+                            ))
+                    }
+                    return ManifestDownloadCompletion(
+                        fileKey: entry.fileKey,
+                        currentFile: entry.file.localRelativePath,
+                        bytesWritten: result.bytesWritten
+                    )
+                }
+            }
+
+            for _ in 0..<min(Self.maxConcurrentDownloads, entries.count) {
+                scheduleNext()
+            }
+
+            while let completion = try await group.next() {
+                progress(
+                    progressState.complete(
+                        fileKey: completion.fileKey,
+                        bytesWritten: completion.bytesWritten,
+                        currentFile: completion.currentFile
+                    ))
+                scheduleNext()
+            }
         }
     }
 
@@ -122,41 +165,110 @@ struct ManifestDownloadRunner {
         return nil
     }
 
-    private func makeProgress(
+}
+
+private struct ManifestDownloadEntry: Sendable {
+    let unit: ManifestDownloadUnit
+    let file: DownloadFile
+    let destinationURL: URL
+
+    var fileKey: String { destinationURL.path }
+}
+
+private struct ManifestDownloadCompletion: Sendable {
+    let fileKey: String
+    let currentFile: String
+    let bytesWritten: Int64
+}
+
+private final class ManifestDownloadProgressState: Sendable {
+    private struct State {
+        var completedFiles: Int
+        var completedBytes: Int64
+        var inProgressBytes: [String: Int64] = [:]
+    }
+
+    private let totalKnownBytes: Int64
+    private let hasUnknownSizes: Bool
+    private let totalFiles: Int
+    private let legacyFractionMultiplier: Double
+    private let state: OSAllocatedUnfairLock<State>
+
+    init(
+        completedFiles: Int,
         completedBytes: Int64,
         totalKnownBytes: Int64,
         hasUnknownSizes: Bool,
-        completedFiles: Int,
         totalFiles: Int,
-        currentFile: String?,
         legacyFractionMultiplier: Double
+    ) {
+        self.totalKnownBytes = totalKnownBytes
+        self.hasUnknownSizes = hasUnknownSizes
+        self.totalFiles = totalFiles
+        self.legacyFractionMultiplier = legacyFractionMultiplier
+        self.state = OSAllocatedUnfairLock(
+            initialState: State(
+                completedFiles: completedFiles,
+                completedBytes: completedBytes
+            ))
+    }
+
+    func updateInProgress(
+        fileKey: String,
+        bytesWritten: Int64,
+        currentFile: String?
     ) -> DownloadUtils.DownloadProgress {
+        state.withLock { state in
+            state.inProgressBytes[fileKey] = max(bytesWritten, 0)
+            return makeProgress(state: state, currentFile: currentFile)
+        }
+    }
+
+    func snapshot(currentFile: String?) -> DownloadUtils.DownloadProgress {
+        state.withLock { state in
+            makeProgress(state: state, currentFile: currentFile)
+        }
+    }
+
+    func complete(
+        fileKey: String,
+        bytesWritten: Int64,
+        currentFile: String?
+    ) -> DownloadUtils.DownloadProgress {
+        state.withLock { state in
+            state.inProgressBytes[fileKey] = nil
+            state.completedFiles += 1
+            state.completedBytes += max(bytesWritten, 0)
+            return makeProgress(state: state, currentFile: currentFile)
+        }
+    }
+
+    private func makeProgress(
+        state: State,
+        currentFile: String?
+    ) -> DownloadUtils.DownloadProgress {
+        let activeBytes = state.inProgressBytes.values.reduce(0, +)
+        let downloadedBytes = state.completedBytes + activeBytes
         let byteFraction: Double?
         let totalBytes: Int64?
         if hasUnknownSizes || totalKnownBytes <= 0 {
             byteFraction = nil
             totalBytes = nil
         } else {
-            byteFraction = min(Double(completedBytes) / Double(totalKnownBytes), 1.0)
+            byteFraction = min(Double(downloadedBytes) / Double(totalKnownBytes), 1.0)
             totalBytes = totalKnownBytes
         }
 
-        let fallbackFraction = totalFiles == 0 ? 1.0 : Double(completedFiles) / Double(totalFiles)
+        let fallbackFraction = totalFiles == 0 ? 1.0 : Double(state.completedFiles) / Double(totalFiles)
         let legacyFraction = legacyFractionMultiplier * (byteFraction ?? fallbackFraction)
 
         return DownloadUtils.DownloadProgress(
             fractionCompleted: min(legacyFraction, legacyFractionMultiplier),
-            phase: .downloading(completedFiles: completedFiles, totalFiles: totalFiles),
-            downloadedBytes: completedBytes,
+            phase: .downloading(completedFiles: state.completedFiles, totalFiles: totalFiles),
+            downloadedBytes: downloadedBytes,
             totalBytes: totalBytes,
             downloadFractionCompleted: byteFraction,
             currentFile: currentFile
         )
     }
-}
-
-private struct ManifestDownloadEntry {
-    let unit: ManifestDownloadUnit
-    let file: DownloadFile
-    let destinationURL: URL
 }

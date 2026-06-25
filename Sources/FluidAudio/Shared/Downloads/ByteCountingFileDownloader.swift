@@ -1,7 +1,11 @@
 import Foundation
 import os.lock
 
-struct ByteCountingFileDownloader {
+actor ByteCountingFileDownloader {
+    private static let parallelRangeThresholdBytes: Int64 = 64 * 1024 * 1024
+    private static let rangeChunkSizeBytes: Int64 = 16 * 1024 * 1024
+    private static let rangeWorkerLimit = 8
+
     private let sessionConfiguration: URLSessionConfiguration
 
     init(session: URLSession = DownloadUtils.sharedSession) {
@@ -15,6 +19,10 @@ struct ByteCountingFileDownloader {
         progress: @escaping @Sendable (Int64) -> Void
     ) async throws -> ValidatedDownloadResult {
         let partialURL = Self.partialURL(for: destinationURL)
+        let progressState = MonotonicDownloadProgressState()
+        let reportProgress: @Sendable (Int64) -> Void = { bytes in
+            progress(progressState.update(bytes))
+        }
         try DownloadUtils.createDirectoryRobustly(at: destinationURL.deletingLastPathComponent())
 
         if let expectedBytes, FileManager.default.fileExists(atPath: destinationURL.path) {
@@ -37,13 +45,38 @@ struct ByteCountingFileDownloader {
         }
 
         do {
+            if let expectedBytes,
+                expectedBytes >= Self.parallelRangeThresholdBytes,
+                Self.existingFileSize(at: partialURL) == 0
+            {
+                do {
+                    return try await performParallelRangeDownload(
+                        request: request,
+                        destinationURL: destinationURL,
+                        partialURL: partialURL,
+                        expectedBytes: expectedBytes,
+                        progress: reportProgress
+                    )
+                } catch {
+                    try? FileManager.default.removeItem(at: partialURL)
+                    return try await performDownload(
+                        request: request,
+                        destinationURL: destinationURL,
+                        partialURL: partialURL,
+                        expectedBytes: expectedBytes,
+                        resumeOffset: 0,
+                        progress: reportProgress
+                    )
+                }
+            }
+
             return try await performDownload(
                 request: request,
                 destinationURL: destinationURL,
                 partialURL: partialURL,
                 expectedBytes: expectedBytes,
                 resumeOffset: Self.existingFileSize(at: partialURL),
-                progress: progress
+                progress: reportProgress
             )
         } catch ByteCountingDownloadError.staleRange {
             try? FileManager.default.removeItem(at: partialURL)
@@ -53,7 +86,129 @@ struct ByteCountingFileDownloader {
                 partialURL: partialURL,
                 expectedBytes: expectedBytes,
                 resumeOffset: 0,
-                progress: progress
+                progress: reportProgress
+            )
+        }
+    }
+
+    private func performParallelRangeDownload(
+        request: URLRequest,
+        destinationURL: URL,
+        partialURL: URL,
+        expectedBytes: Int64,
+        progress: @escaping @Sendable (Int64) -> Void
+    ) async throws -> ValidatedDownloadResult {
+        let ranges = Self.makeRanges(totalBytes: expectedBytes)
+        let rangeDirectory = partialURL.deletingLastPathComponent()
+            .appendingPathComponent(partialURL.lastPathComponent + ".ranges", isDirectory: true)
+        try? FileManager.default.removeItem(at: rangeDirectory)
+        try FileManager.default.createDirectory(at: rangeDirectory, withIntermediateDirectories: true)
+        let rangeProgress = ParallelRangeProgressState(rangeCount: ranges.count)
+
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var nextIndex = 0
+
+                func scheduleNext() {
+                    guard nextIndex < ranges.count else { return }
+                    let range = ranges[nextIndex]
+                    nextIndex += 1
+                    group.addTask {
+                        try await self.downloadRangePart(
+                            range,
+                            request: request,
+                            rangeDirectory: rangeDirectory,
+                            expectedTotalBytes: expectedBytes
+                        ) { bytes in
+                            progress(rangeProgress.update(rangeIndex: range.index, bytesWritten: bytes))
+                        }
+                    }
+                }
+
+                for _ in 0..<min(Self.rangeWorkerLimit, ranges.count) {
+                    scheduleNext()
+                }
+
+                while try await group.next() != nil {
+                    scheduleNext()
+                }
+            }
+
+            if FileManager.default.fileExists(atPath: partialURL.path) {
+                try FileManager.default.removeItem(at: partialURL)
+            }
+            FileManager.default.createFile(atPath: partialURL.path, contents: nil)
+            let output = try FileHandle(forWritingTo: partialURL)
+            defer { try? output.close() }
+            for range in ranges {
+                let rangeURL = rangeDirectory.appendingPathComponent("\(range.index).part")
+                let input = try FileHandle(forReadingFrom: rangeURL)
+                defer { try? input.close() }
+                while true {
+                    let data = input.readData(ofLength: 1024 * 1024)
+                    guard !data.isEmpty else { break }
+                    try output.write(contentsOf: data)
+                }
+            }
+            try output.synchronize()
+
+            let assembledBytes = try Self.fileSize(at: partialURL)
+            guard assembledBytes == expectedBytes else {
+                throw DownloadUtils.HuggingFaceDownloadError.downloadFailed(
+                    path: destinationURL.lastPathComponent,
+                    underlying: NSError(
+                        domain: "FluidAudio.ByteCountingFileDownloader",
+                        code: 3,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Assembled \(assembledBytes) bytes, expected \(expectedBytes)"
+                        ]
+                    )
+                )
+            }
+
+            try Self.replaceItem(at: destinationURL, with: partialURL)
+            try? FileManager.default.removeItem(at: rangeDirectory)
+            progress(expectedBytes)
+            return ValidatedDownloadResult(finalURL: destinationURL, bytesWritten: expectedBytes, resumed: false)
+        } catch {
+            try? FileManager.default.removeItem(at: rangeDirectory)
+            throw error
+        }
+    }
+
+    private func downloadRangePart(
+        _ range: ParallelRange,
+        request: URLRequest,
+        rangeDirectory: URL,
+        expectedTotalBytes: Int64,
+        progress: @escaping @Sendable (Int64) -> Void
+    ) async throws {
+        var rangeRequest = request
+        rangeRequest.setValue("bytes=\(range.start)-\(range.end)", forHTTPHeaderField: "Range")
+        let destinationURL = rangeDirectory.appendingPathComponent("\(range.index).part")
+        let partialURL = Self.partialURL(for: destinationURL)
+        let result = try await performDownload(
+            request: rangeRequest,
+            destinationURL: destinationURL,
+            partialURL: partialURL,
+            expectedBytes: range.expectedByteCount,
+            resumeOffset: 0,
+            requiredContentRange: RequiredContentRange(start: range.start, total: expectedTotalBytes)
+        ) { bytes in
+            progress(min(bytes, range.expectedByteCount))
+        }
+        guard result.bytesWritten == range.expectedByteCount else {
+            throw DownloadUtils.HuggingFaceDownloadError.downloadFailed(
+                path: request.url?.lastPathComponent ?? "range",
+                underlying: NSError(
+                    domain: "FluidAudio.ByteCountingFileDownloader",
+                    code: 4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Downloaded range \(result.bytesWritten) bytes, expected \(range.expectedByteCount)"
+                    ]
+                )
             )
         }
     }
@@ -64,6 +219,7 @@ struct ByteCountingFileDownloader {
         partialURL: URL,
         expectedBytes: Int64?,
         resumeOffset: Int64,
+        requiredContentRange: RequiredContentRange? = nil,
         progress: @escaping @Sendable (Int64) -> Void
     ) async throws -> ValidatedDownloadResult {
         var request = request
@@ -81,6 +237,7 @@ struct ByteCountingFileDownloader {
                 partialURL: partialURL,
                 expectedBytes: expectedBytes,
                 resumeOffset: resumeOffset,
+                requiredContentRange: requiredContentRange,
                 progress: progress,
                 continuation: continuation
             )
@@ -110,10 +267,62 @@ struct ByteCountingFileDownloader {
         guard FileManager.default.fileExists(atPath: url.path) else { return 0 }
         return (try? fileSize(at: url)) ?? 0
     }
+
+    private static func makeRanges(totalBytes: Int64) -> [ParallelRange] {
+        var ranges: [ParallelRange] = []
+        var start: Int64 = 0
+        while start < totalBytes {
+            let end = min(start + rangeChunkSizeBytes - 1, totalBytes - 1)
+            ranges.append(ParallelRange(index: ranges.count, start: start, end: end))
+            start = end + 1
+        }
+        return ranges
+    }
 }
 
 private enum ByteCountingDownloadError: Error {
     case staleRange
+}
+
+private struct RequiredContentRange: Sendable {
+    let start: Int64
+    let total: Int64
+}
+
+private final class MonotonicDownloadProgressState: Sendable {
+    private let bytes = OSAllocatedUnfairLock<Int64>(initialState: 0)
+
+    func update(_ value: Int64) -> Int64 {
+        bytes.withLock { bytes in
+            bytes = max(bytes, value)
+            return bytes
+        }
+    }
+}
+
+private struct ParallelRange: Sendable {
+    let index: Int
+    let start: Int64
+    let end: Int64
+
+    var expectedByteCount: Int64 {
+        end - start + 1
+    }
+}
+
+private final class ParallelRangeProgressState: Sendable {
+    private let state: OSAllocatedUnfairLock<[Int64]>
+
+    init(rangeCount: Int) {
+        state = OSAllocatedUnfairLock(initialState: Array(repeating: 0, count: rangeCount))
+    }
+
+    func update(rangeIndex: Int, bytesWritten: Int64) -> Int64 {
+        state.withLock { state in
+            state[rangeIndex] = max(bytesWritten, 0)
+            return state.reduce(0, +)
+        }
+    }
 }
 
 private final class ByteCountingDataDelegate: NSObject, URLSessionDataDelegate {
@@ -121,6 +330,7 @@ private final class ByteCountingDataDelegate: NSObject, URLSessionDataDelegate {
     private let partialURL: URL
     private let expectedBytes: Int64?
     private let resumeOffset: Int64
+    private let requiredContentRange: RequiredContentRange?
     private let progress: @Sendable (Int64) -> Void
     private let continuation: CheckedContinuation<ValidatedDownloadResult, Error>
     private let state: OSAllocatedUnfairLock<ByteCountingDataState>
@@ -130,6 +340,7 @@ private final class ByteCountingDataDelegate: NSObject, URLSessionDataDelegate {
         partialURL: URL,
         expectedBytes: Int64?,
         resumeOffset: Int64,
+        requiredContentRange: RequiredContentRange?,
         progress: @escaping @Sendable (Int64) -> Void,
         continuation: CheckedContinuation<ValidatedDownloadResult, Error>
     ) {
@@ -137,6 +348,7 @@ private final class ByteCountingDataDelegate: NSObject, URLSessionDataDelegate {
         self.partialURL = partialURL
         self.expectedBytes = expectedBytes
         self.resumeOffset = resumeOffset
+        self.requiredContentRange = requiredContentRange
         self.progress = progress
         self.continuation = continuation
         self.state = OSAllocatedUnfairLock(
@@ -226,6 +438,20 @@ private final class ByteCountingDataDelegate: NSObject, URLSessionDataDelegate {
                 statusCode: response.statusCode,
                 message: "HTTP \(response.statusCode)"
             )
+        }
+
+        if let requiredContentRange {
+            guard response.statusCode == 206 else {
+                throw ByteCountingDownloadError.staleRange
+            }
+            let contentRange = try ContentRange(response: response)
+            guard
+                contentRange.start == requiredContentRange.start,
+                contentRange.total == requiredContentRange.total
+            else {
+                throw ByteCountingDownloadError.staleRange
+            }
+            return
         }
 
         if resumeOffset > 0 {
