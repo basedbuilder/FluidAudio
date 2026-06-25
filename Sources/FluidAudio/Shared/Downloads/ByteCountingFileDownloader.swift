@@ -300,7 +300,6 @@ private final class ByteCountingDataDelegate: NSObject, URLSessionDataDelegate {
                 state.fileHandle?.seekToEndOfFile()
             }
             state.fileHandle?.write(data)
-            try? state.fileHandle?.synchronize()
             state.bytesWritten += Int64(data.count)
             return state.bytesWritten
         }
