@@ -184,11 +184,17 @@ public actor SenseVoiceManager {
                 appendArgmax { p[base + $0 * vocabStride] }
             }
         } else if logits.dataType == .float16 {
+            #if arch(arm64)
             let p = logits.dataPointer.assumingMemoryBound(to: Float16.self)
             for t in 0..<frames {
                 let base = t * timeStride
                 appendArgmax { Float(p[base + $0 * vocabStride]) }
             }
+            #else
+            for t in 0..<frames {
+                appendArgmax { logits[[0, t as NSNumber, $0 as NSNumber]].floatValue }
+            }
+            #endif
         } else {
             for t in 0..<frames {
                 appendArgmax { logits[[0, t as NSNumber, $0 as NSNumber]].floatValue }
