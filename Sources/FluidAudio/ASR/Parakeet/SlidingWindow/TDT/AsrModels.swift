@@ -533,42 +533,35 @@ extension AsrModels {
             }
         }
 
-        struct DownloadSpec {
-            let fileName: String
-            let computeUnits: MLComputeUnits
-        }
-
-        let defaultUnits = defaultConfiguration().computeUnits
         let fileNames = getModelFileNames(version: version, encoderPrecision: encoderPrecision)
-
-        let specs: [DownloadSpec]
+        let requiredFileNames: Set<String>
         if version.hasFusedEncoder {
-            specs = [
-                // Fused preprocessor+encoder runs on ANE
-                DownloadSpec(fileName: Names.preprocessorFile, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.decoder, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.joint, computeUnits: defaultUnits),
+            requiredFileNames = [
+                Names.preprocessorFile,
+                fileNames.decoder,
+                fileNames.joint,
             ]
         } else {
-            specs = [
-                // Preprocessor ops map to CPU-only across all platforms.
-                DownloadSpec(fileName: Names.preprocessorFile, computeUnits: .cpuOnly),
-                DownloadSpec(fileName: fileNames.encoder, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.decoder, computeUnits: defaultUnits),
-                DownloadSpec(fileName: fileNames.joint, computeUnits: defaultUnits),
+            requiredFileNames = [
+                Names.preprocessorFile,
+                fileNames.encoder,
+                fileNames.decoder,
+                fileNames.joint,
             ]
         }
 
-        for spec in specs {
-            _ = try await DownloadUtils.loadModels(
-                version.repo,
-                modelNames: [spec.fileName],
-                directory: parentDir,
-                computeUnits: spec.computeUnits,
-                variant: downloadVariant,
-                progressHandler: progressHandler
-            )
-        }
+        let defaultRequiredFileNames = ModelNames.getRequiredModelNames(
+            for: version.repo,
+            variant: downloadVariant
+        )
+        let additionalFileNames = requiredFileNames.subtracting(defaultRequiredFileNames)
+        try await DownloadUtils.downloadRepo(
+            version.repo,
+            to: parentDir,
+            variant: downloadVariant,
+            additionalModelNames: additionalFileNames,
+            progressHandler: progressHandler
+        )
 
         logger.info("Successfully downloaded ASR models")
         return targetDir
