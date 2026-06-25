@@ -4,7 +4,7 @@ FluidAudio usually downloads ASR CoreML bundles from HuggingFace with `AsrModels
 
 ## Required assets
 
-Each ASR release ships four CoreML bundles plus the shared vocabulary file:
+Most Parakeet ASR releases ship four CoreML bundles plus the shared vocabulary file:
 
 - `Preprocessor.mlmodelc`
 - `Encoder.mlmodelc`
@@ -12,10 +12,15 @@ Each ASR release ships four CoreML bundles plus the shared vocabulary file:
 - `JointDecision.mlmodelc`
 - `parakeet_vocab.json`
 
+`AsrModelVersion.tdtCtc110m` is the exception: its preprocessor and encoder are
+fused, so that repo ships only `Preprocessor.mlmodelc`, `Decoder.mlmodelc`,
+`JointDecision.mlmodelc`, and `parakeet_vocab.json`.
+
 Pick the folder that matches the version you want to serve:
 
 - Multilingual (`AsrModelVersion.v3`): `FluidInference/parakeet-tdt-0.6b-v3-coreml`
 - English only (`AsrModelVersion.v2`): `FluidInference/parakeet-tdt-0.6b-v2-coreml`
+- English fast (`AsrModelVersion.tdtCtc110m`): `FluidInference/parakeet-tdt-ctc-110m-coreml`
 
 ## Stage the directory layout
 
@@ -33,7 +38,7 @@ Pick the folder that matches the version you want to serve:
     └── parakeet_vocab.json
 ```
 
-If you are deploying the English-only variant, swap the folder name for `parakeet-tdt-0.6b-v2-coreml` and ensure the four `.mlmodelc` bundles plus `parakeet_vocab.json` are present.
+If you are deploying the English-only v2 variant, swap the folder name for `parakeet-tdt-0.6b-v2-coreml` and ensure the four `.mlmodelc` bundles plus `parakeet_vocab.json` are present. If you are deploying the English Fast TDT-CTC-110M variant, swap the folder name for `parakeet-tdt-ctc-110m-coreml` and do not stage a separate `Encoder.mlmodelc`; the encoder is fused into `Preprocessor.mlmodelc`.
 
 ### Manual download options
 
@@ -46,7 +51,7 @@ If you are deploying the English-only variant, swap the folder name for `parakee
 2. Use the HuggingFace web UI to download the `.tar` archives for each `.mlmodelc` bundle and extract them into the layout above.
 3. Copy the prepared directory from another machine that already ran `downloadAndLoad` (the cache lives at `~/Library/Application Support/FluidAudio/Models/<repo>` on macOS).
 
-After staging the files, call `AsrModels.modelsExist(at:)` in your app or a small Swift script to double-check that the four bundles and `parakeet_vocab.json` are readable.
+After staging the files, call `AsrModels.modelsExist(at:version:)` in your app or a small Swift script to double-check that the version-specific bundles and `parakeet_vocab.json` are readable.
 
 ## Loading models without auto-download
 
@@ -92,9 +97,16 @@ let englishRepo = URL(fileURLWithPath: "/opt/models/parakeet-tdt-0.6b-v2-coreml"
 let englishModels = try await AsrModels.load(from: englishRepo, version: .v2)
 ```
 
+Pass `.tdtCtc110m` for the English Fast repo:
+
+```swift
+let englishFastRepo = URL(fileURLWithPath: "/opt/models/parakeet-tdt-ctc-110m-coreml", isDirectory: true)
+let englishFastModels = try await AsrModels.load(from: englishFastRepo, version: .tdtCtc110m)
+```
+
 ### Troubleshooting tips
 
-- Use `AsrModels.modelsExist(at:)` before calling `load` to confirm the vocabulary file and all four `.mlmodelc` bundles are present.
+- Use `AsrModels.modelsExist(at:version:)` before calling `load` to confirm the vocabulary file and the expected `.mlmodelc` bundles are present.
 - `AsrModels.load` reads the vocabulary from the same repo folder. Make sure `parakeet_vocab.json` sits beside the model bundles.
 - If you see `AsrModelsError.modelNotFound`, double-check for typos in the folder names or missing `coremldata.bin` files inside each `.mlmodelc` directory.
 - `load` still reports helpful diagnostics through `OSLog`. Run your build with the `OS_ACTIVITY_MODE` environment variable cleared so you can see the log lines during bring-up.
