@@ -64,12 +64,18 @@ public struct TTS {
         var kokoroAneVariant: KokoroAneVariant = .english
         var lexiconPath: String? = nil
         var text: String? = nil
+        // KokoroAne: treat the positional/`--text` value as a pre-computed
+        // phoneme string (IPA for en/ja, Bopomofo+tone for zh) and bypass
+        // G2P via synthesizeFromPhonemes. Required for `.japanese`, which
+        // ships no text frontend (issue #698).
+        var treatAsPhonemes = false
         var deEss = true
         var backend: TtsBackend = .kokoroAne
         var cloneVoicePath: String? = nil
         var voiceFilePath: String? = nil
         var saveVoicePath: String? = nil
         var pocketLanguage: PocketTtsLanguage = .english
+        var pocketPlacement: PocketTtsModelPlacement = .gpu
         // PocketTTS deterministic-seed mode (uses session API for fixed RNG).
         var pocketSeed: UInt64? = nil
         // StyleTTS2 zero-shot args.
@@ -86,6 +92,9 @@ public struct TTS {
         var supertonicVoiceStylePath: String? = nil
         var supertonicTotalSteps: Int = Supertonic3Constants.defaultTotalSteps
         var supertonicSpeed: Float = Supertonic3Constants.defaultSpeed
+        // VectorEstimator build: fp16 | int8/int6/int4 (ANE-bucketed) |
+        // dyn-int8/dyn-int6/dyn-int4 (dynamic CPU/GPU). Default fp16.
+        var supertonicVE: Supertonic3VectorEstimator = .aneBucketed(.int4)
 
         var i = 0
         while i < arguments.count {
@@ -109,6 +118,8 @@ public struct TTS {
                     metricsPath = arguments[i + 1]
                     i += 1
                 }
+            case "--phonemes":
+                treatAsPhonemes = true
             case "--variant", "--model-variant":
                 if i + 1 < arguments.count {
                     let value = arguments[i + 1].lowercased()
@@ -117,6 +128,8 @@ public struct TTS {
                         kokoroAneVariant = .english
                     case "zh", "mandarin", "zh-cn", "zh_cn":
                         kokoroAneVariant = .mandarin
+                    case "ja", "japanese", "jp":
+                        kokoroAneVariant = .japanese
                     default:
                         logger.warning("Unknown variant preference '\(arguments[i + 1])'; ignoring")
                     }
@@ -152,6 +165,18 @@ public struct TTS {
             case "--voice-style":
                 if i + 1 < arguments.count {
                     supertonicVoiceStylePath = arguments[i + 1]
+                    i += 1
+                }
+            case "--ve-variant", "--vector-estimator":
+                if i + 1 < arguments.count {
+                    let raw = arguments[i + 1].lowercased()
+                    if let v = Self.parseSupertonicVE(raw) {
+                        supertonicVE = v
+                    } else {
+                        logger.warning(
+                            "Unknown --ve-variant '\(raw)'; using fp16. "
+                                + "Valid: fp16, int8/int6/int4 (ANE), dyn-int8/dyn-int6/dyn-int4.")
+                    }
                     i += 1
                 }
             case "--total-steps":
@@ -218,6 +243,19 @@ public struct TTS {
                     saveVoicePath = arguments[i + 1]
                     i += 1
                 }
+            case "--placement":
+                if i + 1 < arguments.count {
+                    let raw = arguments[i + 1].lowercased()
+                    if let parsed = PocketTtsModelPlacement(rawValue: raw) {
+                        pocketPlacement = parsed
+                    } else {
+                        logger.error(
+                            "Unknown PocketTTS placement '\(arguments[i + 1])'. Supported: gpu, ane, ane-state"
+                        )
+                        return
+                    }
+                    i += 1
+                }
             case "--language":
                 if i + 1 < arguments.count {
                     let raw = arguments[i + 1].lowercased()
@@ -255,11 +293,13 @@ public struct TTS {
                 text: text, output: output, voice: voice, deEss: deEss,
                 metricsPath: metricsPath, cloneVoicePath: cloneVoicePath,
                 voiceFilePath: voiceFilePath, saveVoicePath: saveVoicePath,
-                language: pocketLanguage, seed: pocketSeed)
+                language: pocketLanguage, seed: pocketSeed,
+                placement: pocketPlacement)
         case .kokoroAne:
             await runKokoroAne(
                 text: text, output: output, voice: voice, metricsPath: metricsPath,
-                variant: kokoroAneVariant, lexiconPath: lexiconPath)
+                variant: kokoroAneVariant, lexiconPath: lexiconPath,
+                treatAsPhonemes: treatAsPhonemes)
         case .styletts2:
             await runStyleTTS2(
                 text: text, ipa: styletts2Ipa,
@@ -274,6 +314,7 @@ public struct TTS {
                 text: text, output: output, language: supertonicLanguage,
                 voiceStylePath: supertonicVoiceStylePath, voiceName: voice,
                 totalSteps: supertonicTotalSteps, speed: supertonicSpeed,
+                vectorEstimator: supertonicVE,
                 metricsPath: metricsPath, cpuOnly: cpuOnly)
         }
     }
@@ -335,7 +376,8 @@ public struct TTS {
         metricsPath: String?, cloneVoicePath: String?,
         voiceFilePath: String?, saveVoicePath: String?,
         language: PocketTtsLanguage,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        placement: PocketTtsModelPlacement = .gpu
     ) async {
         do {
             let tStart = Date()
@@ -343,8 +385,9 @@ public struct TTS {
                 voice == TtsConstants.recommendedVoice
                 ? PocketTtsConstants.defaultVoice : voice
             let manager = PocketTtsManager(
-                defaultVoice: pocketVoice, language: language)
-            logger.info("PocketTTS language: \(language.rawValue)")
+                defaultVoice: pocketVoice, language: language, placement: placement)
+            logger.info(
+                "PocketTTS language: \(language.rawValue), placement: \(placement.rawValue)")
 
             let tLoad0 = Date()
             try await manager.initialize()
@@ -479,7 +522,7 @@ public struct TTS {
 
     private static func runKokoroAne(
         text: String, output: String, voice: String, metricsPath: String?,
-        variant: KokoroAneVariant, lexiconPath: String?
+        variant: KokoroAneVariant, lexiconPath: String?, treatAsPhonemes: Bool
     ) async {
         do {
             let tStart = Date()
@@ -501,10 +544,10 @@ public struct TTS {
                     if let lex = try loadMandarinLexicon(from: lexiconPath) {
                         await manager.setMandarinCustomLexicon(lex)
                     }
-                case .english:
+                case .english, .japanese:
                     logger.warning(
-                        "--lexicon ignored: KokoroAne English variant has "
-                            + "no custom lexicon support yet (only Mandarin does).")
+                        "--lexicon ignored: only the KokoroAne Mandarin variant "
+                            + "supports a custom lexicon.")
                 }
             }
 
@@ -513,14 +556,22 @@ public struct TTS {
             let tLoad1 = Date()
 
             let tSynth0 = Date()
-            // synthesizeDetailed handles both variants: English routes
-            // through G2PModel, Mandarin routes Hanzi through MandarinG2P
-            // (and passes through pre-computed Bopomofo verbatim).
-            let detailed = try await manager.synthesizeDetailed(
-                text: text, voice: resolvedVoice, speed: 1.0)
+            // synthesizeDetailed handles English (G2PModel) and Mandarin
+            // (MandarinG2P, with pass-through for pre-computed Bopomofo).
+            // With --phonemes, or for Japanese (no text frontend), bypass
+            // G2P and feed the input as a pre-computed phoneme string.
+            let detailed: KokoroAneSynthesisResult
+            if treatAsPhonemes || variant == .japanese {
+                detailed = try await manager.synthesizeFromPhonemesDetailed(
+                    text, voice: resolvedVoice, speed: 1.0)
+            } else {
+                detailed = try await manager.synthesizeDetailed(
+                    text: text, voice: resolvedVoice, speed: 1.0)
+            }
             let wav = try AudioWAV.data(
                 from: detailed.samples,
-                sampleRate: Double(detailed.sampleRate))
+                sampleRate: Double(detailed.sampleRate),
+                normalize: variant != .japanese)
             let tSynth1 = Date()
 
             let outURL = resolveInputURL(output)
@@ -734,16 +785,32 @@ public struct TTS {
     /// Run Supertonic-3 multilingual TTS. Voice comes from a built-in style
     /// (`--voice F1`..`M5`, downloaded on demand, default `M1`) or an explicit
     /// `--voice-style <file.json>`, which overrides `--voice`.
+    /// Map a `--ve-variant` token to a `Supertonic3VectorEstimator`.
+    private static func parseSupertonicVE(_ raw: String) -> Supertonic3VectorEstimator? {
+        func q(_ s: String) -> Supertonic3Quantization? { Supertonic3Quantization(rawValue: s) }
+        switch raw {
+        case "fp16", "fp16dynamic": return .fp16Dynamic
+        case "default", "": return .aneBucketed(.int4)
+        case "int8", "int6", "int4", "ane-int8", "ane-int6", "ane-int4":
+            return q(String(raw.split(separator: "-").last!)).map { .aneBucketed($0) }
+        case "dyn-int8", "dyn-int6", "dyn-int4", "dynamic-int8", "dynamic-int6", "dynamic-int4":
+            return q("int" + String(raw.suffix(1))).map { .dynamic($0) }
+        default: return nil
+        }
+    }
+
     private static func runSupertonic3(
         text: String, output: String, language: String,
         voiceStylePath: String?, voiceName: String,
         totalSteps: Int, speed: Float,
+        vectorEstimator: Supertonic3VectorEstimator,
         metricsPath: String?, cpuOnly: Bool
     ) async {
         do {
             let tStart = Date()
             let computeUnits: MLComputeUnits = cpuOnly ? .cpuOnly : .cpuAndNeuralEngine
-            let manager = Supertonic3Manager(computeUnits: computeUnits)
+            let manager = Supertonic3Manager(
+                computeUnits: computeUnits, vectorEstimator: vectorEstimator)
 
             let tLoad0 = Date()
             try await manager.initialize()
@@ -889,6 +956,9 @@ public struct TTS {
                                    portuguese, portuguese_24l, spanish, spanish_24l
                                    Note: French is 24-layer only (no 6-layer pack upstream)
               --seed N             Deterministic-mode seed (uses session API for fixed RNG)
+              --placement P        Model placement: gpu (default), ane (rank-4 ANE models),
+                                   ane-state (Trial 23 MLState multifunction pipeline;
+                                   macOS 15+/iOS 18+, requires pocket_state.mlmodelc)
 
             Voice Cloning examples:
               # Clone and synthesize in one step

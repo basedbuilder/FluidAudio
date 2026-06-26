@@ -80,6 +80,43 @@ iPhone 16 Pro Max run, and only for models that were reloaded during the session
 | Decoder       |                       88.49 |                        8.11 |              146.01 | MLComputeUnits(rawValue: 1) |
 | JointDecision |                       48.46 |                        7.97 |               71.85 | MLComputeUnits(rawValue: 1) |
 
+## Parakeet Unified (English, batch + streaming)
+
+Unified FastConformer-RNNT — one checkpoint serves both offline batch and chunked-attention
+streaming, English with punctuation and capitalization. Greedy RNNT decode (no TDT duration
+head); batch and streaming share the same decoder and differ only in the encoder window
+(offline 15 s full-attention vs streaming 7.68 s chunked).
+
+Model: [FluidInference/parakeet-unified-en-0.6b-coreml](https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml)
+
+Hardware: Apple M5 Pro, macOS 26. Encoder int8 on ANE (`.cpuAndNeuralEngine`).
+
+### LibriSpeech test-clean (2620 files, 5.40h audio)
+
+| Mode      | WER (Avg) | Aggregate WER | Median WER | Overall RTFx | Median RTFx | Long files (>15s) |
+|-----------|-----------|---------------|------------|--------------|-------------|-------------------|
+| Batch     | 2.15%     | 1.68%         | 0.00%      | 123.3x       | 111.5x      | 238               |
+| Streaming | 2.21%     | 1.79%         | 0.00%      | 29.1x        | 53.1x       | 238               |
+
+Same harness and `TextNormalizer` as `asr-benchmark`, so directly comparable to the
+Transcription numbers above: Parakeet TDT v3 = 2.6% Avg WER / 110x RTFx (multilingual, no
+punctuation). For English files, Unified batch wins on WER, throughput, and punctuation; TDT v3
+remains the multilingual option.
+
+- **Avg WER** is the mean of per-file WER (matches `asr-benchmark`); **Aggregate WER** is total errors ÷ total words.
+- Long files (> 15 s) are not skipped — batch uses overlapping 15 s windows merged on a 2 s overlap; streaming runs them as one continuous session.
+- Streaming's overall RTFx falls below its median because it re-encodes a 7.68 s window per 1.04 s chunk (the latency tax) — long files amortize that poorly. Batch only re-encodes the 2 s overlap, so throughput stays flat. **Use batch for files, streaming for live audio.**
+- int8 encoder is WER-lossless vs fp16 (within noise) at half the size.
+
+```bash
+# Full benchmark, both modes (auto-downloads dataset + models)
+swift run -c release fluidaudiocli unified-benchmark --mode both
+
+# Single mode, limited files, or fp16 encoder
+swift run -c release fluidaudiocli unified-benchmark --mode streaming --max-files 100
+swift run -c release fluidaudiocli unified-benchmark --mode batch --precision fp16
+```
+
 ## Transcription with Keyword Boosting
 
 CTC-based custom vocabulary boosting system, which enables accurate recognition of domain-specific terms (company names, technical jargon, proper nouns) without retraining the ASR model.
@@ -290,125 +327,6 @@ swift run fluidaudiocli vad-benchmark --dataset musan-full --num-files all --thr
 [23:02:35.711] [INFO] [VAD] Files Processed: 2016
 [23:02:35.711] [INFO] [VAD] Avg Time per File: 0.160s
 [23:02:35.744] [INFO] [VAD] Results saved to: vad_benchmark_results.json
-```
-
-## Qwen3-ASR (Beta / In Progress)
-
-Encoder-decoder ASR using Qwen3-ASR-0.6B converted to CoreML. Autoregressive generation with KV-cache.
-
-> **Note:** WER/CER may be higher than the original PyTorch model due to CoreML conversion limitations. See FLEURS results below for full multilingual benchmarks.
-
-Model: [FluidInference/qwen3-asr-0.6b-coreml](https://huggingface.co/FluidInference/qwen3-asr-0.6b-coreml) (f32 variant)
-
-Hardware: Apple M2, 2022, macOS 26
-
-### LibriSpeech test-clean (2620 files)
-
-| Metric | Value |
-|--------|-------|
-| WER (Avg) | 4.4% |
-| WER (Median) | 0.0% |
-| RTFx | 2.8x |
-| Per-token | ~75ms |
-
-### AISHELL-1 Chinese (6920 files, 9.7h audio)
-
-| Metric | Value |
-|--------|-------|
-| CER (Avg) | 6.6% |
-| WER (Avg) | 10.3% |
-| Median RTFx | 4.6x |
-| Overall RTFx | 3.8x |
-| Processing Time | 2.6h |
-
-**Methodology notes:**
-- CER (Character Error Rate) is the primary metric for Chinese ASR, as per the [Qwen3-ASR Technical Report](https://arxiv.org/html/2601.21337v1): *"We use CER for character-based languages (e.g., Mandarin Chinese, Cantonese, and Korean) and WER for word-delimited languages"*
-- WER calculation uses Apple's `NLTokenizer` for Chinese word segmentation; we were unable to verify how official Qwen3-ASR evaluation performs tokenization
-- Official Qwen3-ASR reports 3.15% on AISHELL-2 (different dataset) per [HuggingFace model card](https://huggingface.co/Qwen/Qwen3-ASR-0.6B); our 6.6% CER on AISHELL-1 suggests some accuracy loss in CoreML conversion
-- **Why AISHELL-1?** AISHELL-2 (1000h) requires an application with institutional affiliation and is restricted to non-commercial use. AISHELL-1 (178h) is openly available under Apache 2.0.
-- Dataset: [AudioLLMs/aishell_1_zh_test](https://huggingface.co/datasets/AudioLLMs/aishell_1_zh_test)
-
-```bash
-# Run AISHELL-1 benchmark
-swift run -c release fluidaudiocli qwen3-benchmark --dataset aishell
-```
-
-### FLEURS Multilingual (30 languages, ~70h audio)
-
-Full benchmark across all 30 languages supported by Qwen3-ASR, matching the official FLEURS tiers.
-
-**Which metric to use:**
-- **CER** for character-based languages (Chinese, Japanese, Korean, Thai, Vietnamese, Cantonese) - WER is meaningless due to word segmentation differences
-- **WER** for word-delimited languages (European, Arabic, etc.)
-
-#### Results by FLEURS Tier
-
-| Tier | Languages | Our CER | Official 0.6B WER |
-|------|-----------|---------|-------------------|
-| FLEURS (12 core) | en, zh, yue, ar, de, es, fr, it, ja, ko, pt, ru | **10.3%** | 10.0% |
-| FLEURS† (8 add) | hi, id, ms, nl, pl, th, tr, vi | **20.9%** | 31.9% |
-| FLEURS†† (10 hardest) | cs, da, el, fa, fi, fil, hu, mk, ro, sv | **41.0%** | 47.8% |
-
-> **Note:** Official Qwen3-ASR reports WER, but for CJK languages this includes word segmentation artifacts. Our CER comparison shows CoreML conversion has minimal accuracy loss on core languages.
-
-#### Full Results (sorted by CER)
-
-| Language | RTFx | Avg CER | Med CER | Avg WER | Med WER | Use |
-|----------|------|---------|---------|---------|---------|-----|
-| en_us | 1.16x | 4.0% | 2.3% | 7.3% | 5.3% | WER |
-| es_419 | 2.04x | 4.9% | 3.0% | 10.5% | 8.1% | WER |
-| it_it | 3.46x | 5.1% | 2.8% | 12.4% | 10.0% | WER |
-| ru_ru | 1.84x | 6.9% | 4.6% | 18.0% | 15.6% | WER |
-| de_de | 1.22x | 8.1% | 5.1% | 16.6% | 13.3% | WER |
-| pt_br | 3.27x | 8.6% | 5.4% | 17.5% | 13.0% | WER |
-| fr_fr | 1.72x | 8.9% | 6.2% | 17.3% | 13.3% | WER |
-| cmn_hans_cn | 1.74x | 9.4% | 5.1% | 99.7%* | 100%* | CER |
-| ko_kr | 1.10x | 10.6% | 7.9% | 23.5% | 21.7% | CER |
-| tr_tr | 2.84x | 11.6% | 9.6% | 33.0% | 31.2% | WER |
-| id_id | 2.86x | 16.0% | 9.1% | 30.9% | 22.2% | WER |
-| nl_nl | 2.29x | 17.2% | 13.6% | 36.5% | 30.3% | WER |
-| ms_my | 2.24x | 17.4% | 13.2% | 37.6% | 33.3% | WER |
-| th_th | 1.42x | 18.3% | 15.4% | 96.8%* | 100%* | CER |
-| ar_eg | 1.53x | 18.5% | 13.8% | 40.3% | 36.4% | WER |
-| ja_jp | 0.83x | 19.3% | 17.1% | 94.4%* | 100%* | CER |
-| yue_hant_hk | 0.87x | 19.5% | 13.8% | 99.8%* | 100%* | CER |
-| vi_vn | 2.69x | 25.4% | 21.0% | 35.9% | 31.0% | CER |
-| fi_fi | 1.56x | 25.9% | 22.7% | 70.3% | 70.0% | WER |
-| hi_in | 0.74x | 30.8% | 21.4% | 36.0% | 30.6% | WER |
-| pl_pl | 1.69x | 30.8% | 27.4% | 61.9% | 60.0% | WER |
-| sv_se | 2.38x | 31.3% | 30.1% | 67.8% | 66.7% | WER |
-| fil_ph | 1.56x | 32.2% | 22.4% | 64.8% | 61.1% | WER |
-| mk_mk | 0.79x | 43.2% | 27.9% | 73.0% | 75.9% | WER |
-| da_dk | 2.33x | 45.5% | 46.5% | 81.1% | 84.6% | WER |
-| fa_ir | 1.88x | 48.9% | 34.4% | 75.1% | 75.0% | WER |
-| el_gr | 0.95x | 51.9% | 39.2% | 78.2% | 76.5% | WER |
-| hu_hu | 1.05x | 59.0% | 55.7% | 91.8% | 95.8% | WER |
-| ro_ro | 1.03x | 60.9% | 56.2% | 97.2% | 100% | WER |
-| cs_cz | 2.26x | 62.2% | 56.5% | 88.2% | 96.2% | WER |
-
-*\*WER >90% is expected for CJK/Thai due to word segmentation - FLEURS references have artificial character-by-character spacing while our output is natural continuous text. CER shows actual transcription quality.*
-
-#### Averages
-
-| Metric | Average | Median |
-|--------|---------|--------|
-| CER (all 30) | 25.1% | 19.4% |
-| RTFx | 1.78x | 1.72x |
-
-#### Speed by Language Type
-
-| Type | Avg RTFx | Notes |
-|------|----------|-------|
-| Romance (es, it, pt, fr) | 2.6x | Fastest |
-| Turkic/Indonesian | 2.5x | Fast |
-| Germanic (en, de, nl) | 1.6x | Medium |
-| Slavic (ru, pl, cs) | 1.9x | Medium |
-| CJK (zh, ja, ko, yue) | 1.1x | Slow - more tokens |
-| Indic (hi) | 0.74x | Slowest |
-
-```bash
-# Run FLEURS benchmark for all languages
-swift run -c release fluidaudiocli qwen3-benchmark --dataset fleurs --languages all
 ```
 
 ## SenseVoice
@@ -923,55 +841,6 @@ Both the English BART G2P and multilingual ByT5 G2P models run fastest on CPU-on
 | cpuOnly | **13.0** |
 | all (ANE+GPU+CPU) | 17.3 |
 | cpuAndGPU | 23.4 |
-
-## CTC zh-CN Mandarin ASR (Experimental)
-
-Parakeet CTC 0.6B zh-CN model converted to CoreML for on-device Mandarin Chinese transcription.
-
-> **⚠️ Experimental Feature**: This is an early preview of Mandarin Chinese ASR support. The API and performance characteristics may change in future releases.
-
-Model: [FluidInference/parakeet-ctc-0.6b-zh-cn-coreml](https://huggingface.co/FluidInference/parakeet-ctc-0.6b-zh-cn-coreml)
-
-Hardware: Apple M2, 2022, macOS 26
-
-### THCHS-30 Test Set
-
-Full benchmark on the complete THCHS-30 test set — 2,495 utterances (250 unique sentences × 10 speakers) from the THCHS-30 corpus.
-
-Dataset: [FluidInference/THCHS-30-tests](https://huggingface.co/datasets/FluidInference/THCHS-30-tests)
-
-```bash
-swift run -c release fluidaudiocli ctc-zh-cn-benchmark --auto-download
-```
-
-| Metric | int8 encoder (0.55 GB) |
-|---|---|
-| **Mean CER** | **8.23%** |
-| **Median CER** | **6.45%** |
-| CER = 0% (perfect) | 435 (17.4%) |
-| CER < 5% | 947 (38.0%) |
-| CER < 10% | 1,674 (67.1%) |
-| CER < 20% | 2,325 (93.2%) |
-| Mean Latency | 614 ms |
-| Mean RTFx | 14.83x |
-
-### Error Analysis
-
-Error analysis from the 100 highest-CER samples (out of the full 2,495) identified 862 substitution errors. The dominant patterns:
-
-- **Homophones / near-homophones**: acoustically similar syllables (e.g. 呢/了, 了/的) account for the majority of substitutions — unavoidable without a language model
-- **Digit representation**: the model may output Arabic digits (1, 5, 2011) when references use Chinese characters (一五, 二零一一); the benchmark normalizer converts digits before scoring to avoid penalizing this
-- **Sentence-final particles**: 了/的/呢/吧 are frequently confused, contributing a disproportionate share of errors given their high occurrence
-
-### Beam Search
-
-Beam search does not improve CER for this model without a language model. Greedy decoding (beam width 1) is recommended.
-
-### Recommendations
-
-- **Greedy decoding** is sufficient for production use at this CER level.
-- For applications requiring <8% CER, a character-level language model would be needed.
-- Int8 encoder (0.55 GB) performs on par with FP32 (1.1 GB).
 
 ## TDT Japanese ASR
 

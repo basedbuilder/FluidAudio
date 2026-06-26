@@ -32,8 +32,6 @@ final class ModelNamesTests: XCTestCase {
         XCTAssertEqual(Repo.parakeetEou160.subPath, "160ms")
         XCTAssertEqual(Repo.parakeetEou320.subPath, "320ms")
         XCTAssertEqual(Repo.parakeetEou1280.subPath, "1280ms")
-        XCTAssertEqual(Repo.qwen3Asr.subPath, "f32")
-        XCTAssertEqual(Repo.qwen3AsrInt8.subPath, "int8")
         XCTAssertNil(Repo.vad.subPath)
         XCTAssertNil(Repo.parakeetV3.subPath)
     }
@@ -51,13 +49,7 @@ final class ModelNamesTests: XCTestCase {
         let validExtensions: Set<String> = [".mlmodelc", ".json", ".bin"]
         let validDirectories: Set<String> = ["constants_bin"]
 
-        // `magpieTts` is intentionally excluded — it is the only repo that ships
-        // bare directory entries (`constants/`, `tokenizer/`) instead of files.
-        // It's a not-production-ready experimental backend; its directory layout
-        // is asserted in `MagpieConstantsTests` rather than the global whitelist.
-        let reposExcludedFromExtensionCheck: Set<Repo> = [.magpieTts]
-
-        for repo in Repo.allCases where !reposExcludedFromExtensionCheck.contains(repo) {
+        for repo in Repo.allCases {
             let models = ModelNames.getRequiredModelNames(for: repo, variant: nil)
             for model in models {
                 let hasValidExtension = validExtensions.contains(where: { model.hasSuffix($0) })
@@ -67,6 +59,23 @@ final class ModelNamesTests: XCTestCase {
                     "Model '\(model)' for \(repo) should have a valid extension or be a known directory"
                 )
             }
+        }
+    }
+
+    func testParakeetUnifiedVariants() {
+        let streaming = ModelNames.getRequiredModelNames(for: .parakeetUnified, variant: nil)
+        let offline = ModelNames.getRequiredModelNames(for: .parakeetUnified, variant: "offline")
+        let streamingFp16 = ModelNames.getRequiredModelNames(for: .parakeetUnified, variant: "fp16")
+        let offlineFp16 = ModelNames.getRequiredModelNames(for: .parakeetUnified, variant: "offline-fp16")
+
+        // int8 encoders are the default; fp16 selected by variant suffix.
+        XCTAssertTrue(streaming.contains(ModelNames.ParakeetUnified.streamingEncoderInt8File))
+        XCTAssertTrue(offline.contains(ModelNames.ParakeetUnified.offlineEncoderInt8File))
+        XCTAssertTrue(streamingFp16.contains(ModelNames.ParakeetUnified.streamingEncoderFp16File))
+        XCTAssertTrue(offlineFp16.contains(ModelNames.ParakeetUnified.offlineEncoderFp16File))
+        // Exactly one encoder per variant set.
+        for set in [streaming, offline, streamingFp16, offlineFp16] {
+            XCTAssertEqual(set.filter { $0.contains("encoder") }.count, 1)
         }
     }
 
@@ -113,11 +122,6 @@ final class ModelNamesTests: XCTestCase {
     func testVADModelNames() {
         XCTAssertEqual(ModelNames.VAD.requiredModels.count, 1)
         XCTAssertTrue(ModelNames.VAD.requiredModels.first!.hasSuffix(".mlmodelc"))
-    }
-
-    func testQwen3ASRRequiredModels() {
-        XCTAssertFalse(ModelNames.Qwen3ASR.requiredModels.isEmpty)
-        XCTAssertFalse(ModelNames.Qwen3ASR.requiredModelsFull.isEmpty)
     }
 
     // MARK: - TDT-CTC-110M Repo Tests

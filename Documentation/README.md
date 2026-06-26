@@ -10,7 +10,6 @@
 - [Getting Started](ASR/GettingStarted.md)
 - [TDT-CTC 110M](ASR/TDT-CTC-110M.md)
 - [Nemotron](ASR/Nemotron.md)
-- [Qwen3 ASR](ASR/Qwen3-ASR.md)
 - [CTC Decoder Guide](CtcDecoderGuide.md)
 - [Custom Vocabulary](ASR/CustomVocabulary.md)
 - [Post-Processing (ITN)](ASR/PostProcessing.md)
@@ -41,7 +40,6 @@
 - [Kokoro ANE (7-stage)](TTS/KokoroAne.md)
 - [PocketTTS](TTS/PocketTTS.md)
 - [StyleTTS2](TTS/StyleTTS2.md)
-- [Magpie](TTS/Magpie.md)
 - [SSML](TTS/SSML.md)
 
 ## Developer Guides
