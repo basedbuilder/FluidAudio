@@ -208,13 +208,14 @@ final class ManifestDownloadRunnerTests: XCTestCase {
         let fileCount = 10
 
         let unit = ManifestDownloadUnit(
-            manifest: DownloadManifest(files: (0..<fileCount).map { index in
-                DownloadFile(
-                    remotePath: "file-\(index).bin",
-                    localRelativePath: "file-\(index).bin",
-                    sizeBytes: 1024
-                )
-            }),
+            manifest: DownloadManifest(
+                files: (0..<fileCount).map { index in
+                    DownloadFile(
+                        remotePath: "file-\(index).bin",
+                        localRelativePath: "file-\(index).bin",
+                        sizeBytes: 1024
+                    )
+                }),
             destinationRoot: tempDir,
             makeRequest: { file in URLRequest(url: URL(string: "https://test.local/\(file.remotePath)")!) }
         )
@@ -235,6 +236,282 @@ final class ManifestDownloadRunnerTests: XCTestCase {
         XCTAssertLessThanOrEqual(counter.maxActive, 6)
     }
 
+    func testRetryableFileDownloadFailureIsRetriedBeforeSuccess() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let unit = ManifestDownloadUnit(
+            manifest: DownloadManifest(files: [
+                DownloadFile(remotePath: "file.bin", localRelativePath: "file.bin", sizeBytes: 4)
+            ]),
+            destinationRoot: tempDir,
+            makeRequest: { file in URLRequest(url: URL(string: "https://test.local/\(file.remotePath)")!) }
+        )
+
+        let samples = DownloadProgressRecorder()
+        let delays = DoubleRecorder()
+        try await ManifestDownloadRunner(
+            downloadFile: { _, destinationURL, _, _ in
+                let attempt = attempts.increment()
+                if attempt < 3 {
+                    throw URLError(.networkConnectionLost)
+                }
+                let data = Data("done".utf8)
+                try data.write(to: destinationURL)
+                return ValidatedDownloadResult(
+                    finalURL: destinationURL, bytesWritten: Int64(data.count), resumed: false)
+            },
+            retrySleep: { delays.append($0) }
+        ).run(
+            units: [unit],
+            legacyFractionMultiplier: 1.0
+        ) {
+            samples.append($0)
+        }
+
+        XCTAssertEqual(attempts.value, 3)
+        XCTAssertEqual(delays.values, [1.0, 2.0])
+        XCTAssertEqual(try Data(contentsOf: tempDir.appendingPathComponent("file.bin")), Data("done".utf8))
+        XCTAssertEqual(samples.values.last?.downloadedBytes, 4)
+        XCTAssertEqual(samples.values.last?.downloadFractionCompleted, 1.0)
+    }
+
+    func testRateLimitFailureIsRetriedBeforeSuccess() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let delays = DoubleRecorder()
+        let unit = singleFileUnit(destinationRoot: tempDir)
+        let samples = DownloadProgressRecorder()
+
+        try await ManifestDownloadRunner(
+            downloadFile: { _, destinationURL, _, _ in
+                let attempt = attempts.increment()
+                if attempt == 1 {
+                    throw DownloadUtils.HuggingFaceDownloadError.rateLimited(
+                        statusCode: 503,
+                        message: "HTTP 503"
+                    )
+                }
+                let data = Data("done".utf8)
+                try data.write(to: destinationURL)
+                return ValidatedDownloadResult(
+                    finalURL: destinationURL, bytesWritten: Int64(data.count), resumed: false)
+            },
+            retrySleep: { delays.append($0) }
+        ).run(
+            units: [unit],
+            legacyFractionMultiplier: 1.0
+        ) {
+            samples.append($0)
+        }
+
+        XCTAssertEqual(attempts.value, 2)
+        XCTAssertEqual(delays.values, [1.0])
+        XCTAssertEqual(samples.values.last?.downloadedBytes, 4)
+        XCTAssertEqual(try Data(contentsOf: tempDir.appendingPathComponent("file.bin")), Data("done".utf8))
+    }
+
+    func testHTTPServerFailureIsRetriedBeforeSuccess() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let delays = DoubleRecorder()
+        let unit = singleFileUnit(destinationRoot: tempDir)
+
+        try await ManifestDownloadRunner(
+            downloadFile: { _, destinationURL, _, _ in
+                let attempt = attempts.increment()
+                if attempt == 1 {
+                    throw DownloadUtils.HuggingFaceDownloadError.downloadFailed(
+                        path: "file.bin",
+                        underlying: NSError(domain: "HTTP", code: 500)
+                    )
+                }
+                let data = Data("done".utf8)
+                try data.write(to: destinationURL)
+                return ValidatedDownloadResult(
+                    finalURL: destinationURL, bytesWritten: Int64(data.count), resumed: false)
+            },
+            retrySleep: { delays.append($0) }
+        ).run(
+            units: [unit],
+            legacyFractionMultiplier: 1.0
+        ) { _ in }
+
+        XCTAssertEqual(attempts.value, 2)
+        XCTAssertEqual(delays.values, [1.0])
+        XCTAssertEqual(try Data(contentsOf: tempDir.appendingPathComponent("file.bin")), Data("done".utf8))
+    }
+
+    func testByteCountingShortReadFailureIsRetriedBeforeSuccess() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let delays = DoubleRecorder()
+        let unit = singleFileUnit(destinationRoot: tempDir)
+
+        try await ManifestDownloadRunner(
+            downloadFile: { _, destinationURL, _, _ in
+                let attempt = attempts.increment()
+                if attempt == 1 {
+                    throw DownloadUtils.HuggingFaceDownloadError.downloadFailed(
+                        path: "file.bin",
+                        underlying: NSError(
+                            domain: "FluidAudio.ByteCountingFileDownloader",
+                            code: 1
+                        )
+                    )
+                }
+                let data = Data("done".utf8)
+                try data.write(to: destinationURL)
+                return ValidatedDownloadResult(
+                    finalURL: destinationURL, bytesWritten: Int64(data.count), resumed: false)
+            },
+            retrySleep: { delays.append($0) }
+        ).run(
+            units: [unit],
+            legacyFractionMultiplier: 1.0
+        ) { _ in }
+
+        XCTAssertEqual(attempts.value, 2)
+        XCTAssertEqual(delays.values, [1.0])
+        XCTAssertEqual(try Data(contentsOf: tempDir.appendingPathComponent("file.bin")), Data("done".utf8))
+    }
+
+
+    func testHTTPNotFoundFailureIsNotRetried() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let delays = DoubleRecorder()
+        let unit = singleFileUnit(destinationRoot: tempDir)
+
+        do {
+            try await ManifestDownloadRunner(
+                downloadFile: { _, _, _, _ in
+                    attempts.increment()
+                    throw DownloadUtils.HuggingFaceDownloadError.downloadFailed(
+                        path: "file.bin",
+                        underlying: NSError(domain: "HTTP", code: 404)
+                    )
+                },
+                retrySleep: { delays.append($0) }
+            ).run(
+                units: [unit],
+                legacyFractionMultiplier: 1.0
+            ) { _ in }
+            XCTFail("Expected HTTP 404 to fail without retry")
+        } catch DownloadUtils.HuggingFaceDownloadError.downloadFailed(_, let underlying) {
+            XCTAssertEqual((underlying as NSError).code, 404)
+        }
+
+        XCTAssertEqual(attempts.value, 1)
+        XCTAssertEqual(delays.values, [])
+    }
+
+    func testRetryableFailureStopsAfterMaxAttempts() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let delays = DoubleRecorder()
+        let unit = singleFileUnit(destinationRoot: tempDir)
+
+        do {
+            try await ManifestDownloadRunner(
+                downloadFile: { _, _, _, _ in
+                    attempts.increment()
+                    throw URLError(.timedOut)
+                },
+                retrySleep: { delays.append($0) }
+            ).run(
+                units: [unit],
+                legacyFractionMultiplier: 1.0
+            ) { _ in }
+            XCTFail("Expected retryable error to fail after max attempts")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .timedOut)
+        }
+
+        XCTAssertEqual(attempts.value, 4)
+        XCTAssertEqual(delays.values, [1.0, 2.0, 4.0])
+    }
+
+    func testRetryProgressReflectsRestartedAttemptWhenRetryReportsFewerBytes() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let unit = singleFileUnit(destinationRoot: tempDir)
+        let samples = DownloadProgressRecorder()
+
+        try await ManifestDownloadRunner(
+            downloadFile: { _, destinationURL, _, progress in
+                let attempt = attempts.increment()
+                if attempt == 1 {
+                    progress(3)
+                    throw URLError(.networkConnectionLost)
+                }
+                progress(1)
+                progress(4)
+                let data = Data("done".utf8)
+                try data.write(to: destinationURL)
+                return ValidatedDownloadResult(
+                    finalURL: destinationURL, bytesWritten: Int64(data.count), resumed: false)
+            },
+            retrySleep: { _ in }
+        ).run(
+            units: [unit],
+            legacyFractionMultiplier: 1.0
+        ) {
+            samples.append($0)
+        }
+
+        let byteSamples = samples.values.compactMap(\.downloadedBytes)
+        XCTAssertEqual(attempts.value, 2)
+        let failedAttemptIndex = try XCTUnwrap(byteSamples.firstIndex(of: 3))
+        let restartedAttemptIndex = try XCTUnwrap(
+            byteSamples[(failedAttemptIndex + 1)...].firstIndex(of: 1)
+        )
+        XCTAssertGreaterThan(restartedAttemptIndex, failedAttemptIndex)
+        XCTAssertEqual(byteSamples.last, 4)
+    }
+
+    func testNonHTTPDownloadFailureIsNotRetried() async throws {
+        let tempDir = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let attempts = IntCounter()
+        let unit = singleFileUnit(destinationRoot: tempDir)
+
+        do {
+            try await ManifestDownloadRunner(
+                downloadFile: { _, _, _, _ in
+                    attempts.increment()
+                    throw DownloadUtils.HuggingFaceDownloadError.downloadFailed(
+                        path: "file.bin",
+                        underlying: NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+                    )
+                },
+                retrySleep: { _ in }
+            ).run(
+                units: [unit],
+                legacyFractionMultiplier: 1.0
+            ) { _ in }
+            XCTFail("Expected local file-system shaped failure to fail without retry")
+        } catch DownloadUtils.HuggingFaceDownloadError.downloadFailed(_, let underlying) {
+            XCTAssertEqual((underlying as NSError).domain, NSCocoaErrorDomain)
+        }
+
+        XCTAssertEqual(attempts.value, 1)
+    }
+
     func testExistingProgressInitializerRemainsSourceCompatible() {
         let progress = DownloadUtils.DownloadProgress(
             fractionCompleted: 0.25,
@@ -246,6 +523,16 @@ final class ManifestDownloadRunnerTests: XCTestCase {
         XCTAssertNil(progress.totalBytes)
         XCTAssertNil(progress.downloadFractionCompleted)
         XCTAssertNil(progress.currentFile)
+    }
+
+    private func singleFileUnit(destinationRoot: URL) -> ManifestDownloadUnit {
+        ManifestDownloadUnit(
+            manifest: DownloadManifest(files: [
+                DownloadFile(remotePath: "file.bin", localRelativePath: "file.bin", sizeBytes: 4)
+            ]),
+            destinationRoot: destinationRoot,
+            makeRequest: { file in URLRequest(url: URL(string: "https://test.local/\(file.remotePath)")!) }
+        )
     }
 
     private func makeDownloader() -> ByteCountingFileDownloader {
@@ -270,6 +557,34 @@ final class DownloadProgressRecorder: Sendable {
     }
 
     func append(_ value: DownloadUtils.DownloadProgress) {
+        storage.withLock { $0.append(value) }
+    }
+}
+
+private final class IntCounter: Sendable {
+    private let storage = OSAllocatedUnfairLock<Int>(initialState: 0)
+
+    var value: Int {
+        storage.withLock { $0 }
+    }
+
+    @discardableResult
+    func increment() -> Int {
+        storage.withLock { value in
+            value += 1
+            return value
+        }
+    }
+}
+
+private final class DoubleRecorder: Sendable {
+    private let storage = OSAllocatedUnfairLock<[Double]>(initialState: [])
+
+    var values: [Double] {
+        storage.withLock { $0 }
+    }
+
+    func append(_ value: Double) {
         storage.withLock { $0.append(value) }
     }
 }

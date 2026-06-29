@@ -787,16 +787,17 @@ extension NemotronMultilingualFleursBenchmark {
 
             // Print summary table
             print("")
-            print(
-                "Language".padding(toLength: 12, withPad: " ", startingAt: 0) + " | "
-                    + "Prompt".padding(toLength: 8, withPad: " ", startingAt: 0) + " | "
-                    + "WER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "CER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "RTFx".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "Duration".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                    + "Processed".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                    + "Skipped"
-            )
+            let headerColumns = [
+                "Language".padding(toLength: 12, withPad: " ", startingAt: 0),
+                "Prompt".padding(toLength: 8, withPad: " ", startingAt: 0),
+                "WER%".padding(toLength: 6, withPad: " ", startingAt: 0),
+                "CER%".padding(toLength: 6, withPad: " ", startingAt: 0),
+                "RTFx".padding(toLength: 6, withPad: " ", startingAt: 0),
+                "Duration".padding(toLength: 9, withPad: " ", startingAt: 0),
+                "Processed".padding(toLength: 9, withPad: " ", startingAt: 0),
+                "Skipped",
+            ]
+            print(headerColumns.joined(separator: " | "))
             print(String(repeating: "-", count: 80))
 
             for r in results {
@@ -806,16 +807,17 @@ extension NemotronMultilingualFleursBenchmark {
                 let durStr = String(format: "%.1fs", r.totalDuration)
                 let procStr = String(r.samplesProcessed)
                 let skipStr = r.samplesSkipped > 0 ? String(r.samplesSkipped) : "-"
-                print(
-                    r.language.padding(toLength: 12, withPad: " ", startingAt: 0) + " | "
-                        + r.promptLanguageCode.padding(toLength: 8, withPad: " ", startingAt: 0) + " | "
-                        + werStr.padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + cerStr.padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + rtfxStr.padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                        + durStr.padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                        + procStr.padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                        + skipStr
-                )
+                let rowColumns = [
+                    r.language.padding(toLength: 12, withPad: " ", startingAt: 0),
+                    r.promptLanguageCode.padding(toLength: 8, withPad: " ", startingAt: 0),
+                    werStr.padding(toLength: 6, withPad: " ", startingAt: 0),
+                    cerStr.padding(toLength: 6, withPad: " ", startingAt: 0),
+                    rtfxStr.padding(toLength: 6, withPad: " ", startingAt: 0),
+                    durStr.padding(toLength: 9, withPad: " ", startingAt: 0),
+                    procStr.padding(toLength: 9, withPad: " ", startingAt: 0),
+                    skipStr,
+                ]
+                print(rowColumns.joined(separator: " | "))
             }
 
             if !results.isEmpty {

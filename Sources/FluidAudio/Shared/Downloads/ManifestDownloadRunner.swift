@@ -3,15 +3,19 @@ import os.lock
 
 struct ManifestDownloadRunner {
     private static let maxConcurrentDownloads = 6
+    private static let maxDownloadAttempts = 4
+    private static let minRetryBackoff: TimeInterval = 1.0
 
-    typealias FileDownloadOperation = @Sendable (
-        URLRequest,
-        URL,
-        Int64?,
-        @escaping @Sendable (Int64) -> Void
-    ) async throws -> ValidatedDownloadResult
+    typealias FileDownloadOperation =
+        @Sendable (
+            URLRequest,
+            URL,
+            Int64?,
+            @escaping @Sendable (Int64) -> Void
+        ) async throws -> ValidatedDownloadResult
 
     private let downloadFile: FileDownloadOperation
+    private let retrySleep: @Sendable (TimeInterval) async throws -> Void
 
     init(downloader: ByteCountingFileDownloader = ByteCountingFileDownloader()) {
         self.downloadFile = { request, destinationURL, expectedBytes, progress in
@@ -22,10 +26,20 @@ struct ManifestDownloadRunner {
                 progress: progress
             )
         }
+        self.retrySleep = Self.defaultRetrySleep
     }
 
     init(downloadFile: @escaping FileDownloadOperation) {
         self.downloadFile = downloadFile
+        self.retrySleep = Self.defaultRetrySleep
+    }
+
+    init(
+        downloadFile: @escaping FileDownloadOperation,
+        retrySleep: @escaping @Sendable (TimeInterval) async throws -> Void
+    ) {
+        self.downloadFile = downloadFile
+        self.retrySleep = retrySleep
     }
 
     func run(
@@ -111,10 +125,10 @@ struct ManifestDownloadRunner {
 
                 group.addTask {
                     let request = try entry.unit.makeRequest(entry.file)
-                    let result = try await downloadFile(
+                    let result = try await downloadWithTransientRetry(
                         request,
-                        entry.destinationURL,
-                        entry.file.sizeBytes
+                        destinationURL: entry.destinationURL,
+                        expectedBytes: entry.file.sizeBytes
                     ) { fileBytes in
                         progress(
                             progressState.updateInProgress(
@@ -145,6 +159,65 @@ struct ManifestDownloadRunner {
                 scheduleNext()
             }
         }
+    }
+
+    private func downloadWithTransientRetry(
+        _ request: URLRequest,
+        destinationURL: URL,
+        expectedBytes: Int64?,
+        progress: @escaping @Sendable (Int64) -> Void
+    ) async throws -> ValidatedDownloadResult {
+        var lastError: Error?
+
+        for attempt in 1...Self.maxDownloadAttempts {
+            do {
+                return try await downloadFile(request, destinationURL, expectedBytes, progress)
+            } catch {
+                lastError = error
+                guard attempt < Self.maxDownloadAttempts, Self.isRetryableDownloadError(error) else {
+                    throw error
+                }
+
+                let backoffSeconds = pow(2.0, Double(attempt - 1)) * Self.minRetryBackoff
+                try await retrySleep(backoffSeconds)
+            }
+        }
+
+        throw lastError ?? DownloadUtils.HuggingFaceDownloadError.invalidResponse
+    }
+
+    private static func defaultRetrySleep(_ seconds: TimeInterval) async throws {
+        try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    private static func isRetryableDownloadError(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .cannotConnectToHost, .cannotFindHost,
+                .networkConnectionLost, .notConnectedToInternet,
+                .dnsLookupFailed, .secureConnectionFailed,
+                .resourceUnavailable:
+                return true
+            default:
+                return false
+            }
+        }
+
+        switch error {
+        case DownloadUtils.HuggingFaceDownloadError.rateLimited:
+            return true
+        case DownloadUtils.HuggingFaceDownloadError.downloadFailed(_, let underlying):
+            let nsError = underlying as NSError
+            return (nsError.domain == "HTTP" && (500...599).contains(nsError.code))
+                || Self.isRetryableByteCountingError(nsError)
+        default:
+            return false
+        }
+    }
+
+    private static func isRetryableByteCountingError(_ error: NSError) -> Bool {
+        guard error.domain == "FluidAudio.ByteCountingFileDownloader" else { return false }
+        return [1, 3, 4].contains(error.code)
     }
 
     private func existingCompleteBytes(file: DownloadFile, destinationURL: URL) throws -> Int64? {
