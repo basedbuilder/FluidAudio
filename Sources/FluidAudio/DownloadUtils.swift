@@ -108,13 +108,15 @@ public class DownloadUtils {
         return lowered.hasPrefix("<!doctype html") || lowered.hasPrefix("<html") || lowered.hasPrefix("<?xml")
     }
 
+    /// `response` is nil when re-validating a fully-downloaded partial file from
+    /// a previous run (no live response to check Content-Type against).
     static func validateDownloadedArtifact(
         at tempURL: URL,
-        response: HTTPURLResponse,
+        response: HTTPURLResponse?,
         path: String,
         expectedSize: Int
     ) throws {
-        if let contentType = response.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
+        if let contentType = response?.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
             contentType.contains("text/html")
         {
             throw HuggingFaceDownloadError.invalidArtifact(
@@ -631,11 +633,9 @@ public class DownloadUtils {
             let fileURL = try ModelRegistry.resolveModel(repo.remotePath, encodedFilePath)
             let request = authorizedRequest(url: fileURL)
 
-            // Download with bounded retry on transient failures. A single TLS or
-            // timeout blip on one of many repo files must not abort the whole
-            // download — the per-file retry absorbs intermittent CDN errors so
-            // the caller doesn't have to restart from zero. See
-            // downloadFileWithRetry for the transient-vs-permanent classification.
+            // Bounded retry on transient failures, with byte-range resume via a
+            // persistent `<dest>.partial` file so retries and re-runs continue a
+            // partially-downloaded file instead of restarting it (#757).
             let onProgress: (@Sendable (Int64, Int64) -> Void)?
             if let handler = progressHandler {
                 let baseBytes = completedBytes
@@ -661,6 +661,7 @@ public class DownloadUtils {
                 request: request,
                 path: file.path,
                 expectedSize: file.size,
+                partialFileURL: destPath.appendingPathExtension("partial"),
                 onProgress: onProgress
             )
 
@@ -737,35 +738,47 @@ public class DownloadUtils {
         }
     }
 
-    // MARK: - Delegate-based download with per-byte progress
+    // MARK: - Streaming download to a persistent file
 
-    /// Download a single file using a delegate to get byte-level progress.
-    ///
-    /// This is a pure transport helper — the caller is responsible for validating
-    /// the HTTP status and moving the temporary file to its final destination.
+    /// Stream a download directly into `destination` so received bytes survive
+    /// a mid-transfer drop (#757). Pure transport: the caller sets resume
+    /// headers and validates the HTTP status. Body bytes are written only for
+    /// 2xx — appended after `resumeOffset` on 206, from byte 0 otherwise.
     ///
     /// - Parameters:
-    ///   - request: The URLRequest to download.
-    ///   - onProgress: Called with `(totalBytesWritten, totalBytesExpected)` as data arrives.
-    /// - Returns: The temporary file URL and HTTP response.
-    /// Internal (not private) so a network-gated test can assert progress fires.
-    static func downloadWithProgress(
+    ///   - resumeOffset: Byte count a 206 appends after; also the base for
+    ///     progress callbacks so resumed progress never dips.
+    ///   - configuration: Session configuration override for tests.
+    ///   - onProgress: `(totalBytesWritten, totalBytesExpected)`, both
+    ///     including `resumeOffset`. Delegate-driven byte progress (#756).
+    ///   - onResponse: Fires before any body byte is written — the resume path
+    ///     persists the validator here so it survives a drop mid-body.
+    /// Internal (not private) so download-resume tests can drive it directly.
+    static func streamDownload(
         request: URLRequest,
-        onProgress: @escaping @Sendable (Int64, Int64) -> Void
-    ) async throws -> (URL, HTTPURLResponse) {
-        let delegate = DownloadProgressDelegate(onProgress: onProgress)
+        to destination: URL,
+        resumeOffset: Int64 = 0,
+        configuration: URLSessionConfiguration? = nil,
+        onProgress: (@Sendable (Int64, Int64) -> Void)? = nil,
+        onResponse: (@Sendable (HTTPURLResponse) -> Void)? = nil
+    ) async throws -> HTTPURLResponse {
+        let delegate = StreamingDownloadDelegate(
+            destination: destination,
+            resumeOffset: resumeOffset,
+            onProgress: onProgress,
+            onResponse: onResponse
+        )
         // Dedicated session with delegate — one per download to avoid cross-talk.
         let session = URLSession(
-            configuration: sharedSession.configuration,
+            configuration: configuration ?? sharedSession.configuration,
             delegate: delegate,
             delegateQueue: nil
         )
         defer { session.finishTasksAndInvalidate() }
 
-        // Explicit download task (not `download(for:)`) so the delegate reports byte progress (#756).
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let task = session.downloadTask(with: request)
+                let task = session.dataTask(with: request)
                 delegate.attach(continuation: continuation, task: task)
                 task.resume()
             }
@@ -774,58 +787,132 @@ public class DownloadUtils {
         }
     }
 
-    // MARK: - Per-file download with bounded retry
+    // MARK: - Per-file download with bounded retry and byte-range resume
 
-    /// Download a single repo file to a temporary URL, retrying transient
-    /// network failures with exponential backoff before validating the HTTP
-    /// status and returning the temp file.
+    /// Sidecar storing the HTTP validator (ETag/Last-Modified) a partial file
+    /// came from; written at response time so it survives a drop mid-body.
+    static func resumeValidatorURL(for partialFileURL: URL) -> URL {
+        partialFileURL.appendingPathExtension("etag")
+    }
+
+    private static func fileSize(at url: URL) -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int64) ?? 0
+    }
+
+    /// Remove a partial download and its validator sidecar.
+    private static func clearPartialDownload(_ partialFileURL: URL) {
+        try? FileManager.default.removeItem(at: partialFileURL)
+        try? FileManager.default.removeItem(at: resumeValidatorURL(for: partialFileURL))
+    }
+
+    /// Resume validator for `If-Range`: a strong ETag, else Last-Modified.
+    /// Weak ETags are unusable for `If-Range` (RFC 9110 §13.1.5); nil means
+    /// resume is unsafe and the file restarts from 0.
+    private static func resumeValidator(from response: HTTPURLResponse) -> String? {
+        if let etag = response.value(forHTTPHeaderField: "ETag"), !etag.hasPrefix("W/") {
+            return etag
+        }
+        return response.value(forHTTPHeaderField: "Last-Modified")
+    }
+
+    /// Download a single repo file with bounded exponential-backoff retry on
+    /// transient failures (timeout/TLS/connectivity, HTTP 429/503/5xx; 4xx and
+    /// non-network errors fail fast — see `isRetryableDownloadError`).
     ///
-    /// Transient (retried): URLSession timeout / TLS / connectivity errors and
-    /// HTTP 429/503/5xx. These are the intermittent CDN failures that otherwise
-    /// abort an entire multi-file repo download on the first blip.
-    ///
-    /// Permanent (fails fast, no backoff): 404 and other 4xx, invalid responses,
-    /// and any non-network error — a genuinely missing or misnamed file should
-    /// surface immediately rather than waste the backoff budget.
+    /// Resume (#757): bytes stream into `partialFileURL`, so a retry — or a new
+    /// process — continues with `Range`/`If-Range` instead of restarting from
+    /// byte 0. A 200 (range ignored / remote changed) restarts the file rather
+    /// than splicing mixed-version bytes.
     ///
     /// - Parameters:
-    ///   - request: The file URLRequest to download.
-    ///   - path: Remote path, used for log/error context.
-    ///   - onProgress: Optional byte-progress callback. When non-nil, a delegate
-    ///     session is used; otherwise the shared session. On a retry the byte
-    ///     counter restarts for that file, so reported progress may briefly dip.
-    /// - Returns: The temporary file URL of a validated (2xx) download.
-    private static func downloadFileWithRetry(
+    ///   - partialFileURL: Where in-flight bytes live (e.g. `<dest>.partial`).
+    ///     Pass nil for a unique temp location (in-run resume only).
+    ///   - configuration: Session configuration override for tests.
+    /// - Returns: The URL of a validated (2xx) fully-written download; the
+    ///   caller moves it into the cache.
+    /// Internal (not private) so download-resume tests can drive it directly.
+    static func downloadFileWithRetry(
         request: URLRequest,
         path: String,
         expectedSize: Int,
+        partialFileURL: URL? = nil,
         onProgress: (@Sendable (Int64, Int64) -> Void)?,
         maxAttempts: Int = 4,
-        minBackoff: TimeInterval = 1.0
+        minBackoff: TimeInterval = 1.0,
+        configuration: URLSessionConfiguration? = nil
     ) async throws -> URL {
+        let defaultPartialURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("partial")
+        let partialURL = partialFileURL ?? defaultPartialURL
+        let validatorURL = resumeValidatorURL(for: partialURL)
         var lastError: Error?
 
         for attempt in 1...maxAttempts {
             do {
-                let tempURL: URL
-                let httpResponse: HTTPURLResponse
+                var attemptRequest = request
+                var resumeOffset: Int64 = 0
 
-                if let onProgress {
-                    (tempURL, httpResponse) = try await downloadWithProgress(
-                        request: request, onProgress: onProgress)
-                } else {
-                    let (url, response) = try await sharedSession.download(for: request)
-                    guard let resp = response as? HTTPURLResponse else {
-                        throw HuggingFaceDownloadError.invalidResponse
+                let partialSize = fileSize(at: partialURL)
+                let validator = (try? String(contentsOf: validatorURL, encoding: .utf8))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if partialSize > 0, let validator, !validator.isEmpty {
+                    if expectedSize > 0 && partialSize >= Int64(expectedSize) {
+                        // A previous run finished the body but didn't get to move
+                        // the file. Validate and reuse it instead of re-fetching.
+                        if (try? validateDownloadedArtifact(
+                            at: partialURL, response: nil, path: path, expectedSize: expectedSize))
+                            != nil
+                        {
+                            try? FileManager.default.removeItem(at: validatorURL)
+                            return partialURL
+                        }
+                        clearPartialDownload(partialURL)
+                    } else {
+                        attemptRequest.setValue("bytes=\(partialSize)-", forHTTPHeaderField: "Range")
+                        attemptRequest.setValue(validator, forHTTPHeaderField: "If-Range")
+                        resumeOffset = partialSize
+                        logger.info(
+                            "Resuming \(path) from byte \(partialSize) (attempt \(attempt))")
                     }
-                    tempURL = url
-                    httpResponse = resp
+                } else if partialSize > 0 {
+                    // Partial bytes with no validator can't be safely resumed.
+                    clearPartialDownload(partialURL)
                 }
+
+                let httpResponse = try await streamDownload(
+                    request: attemptRequest,
+                    to: partialURL,
+                    resumeOffset: resumeOffset,
+                    configuration: configuration,
+                    onProgress: onProgress,
+                    onResponse: { response in
+                        // Persist the validator as soon as the fresh body starts, so
+                        // a drop mid-body still leaves it for the next attempt. A 206
+                        // keeps the validator of the response it is extending.
+                        guard response.statusCode != 206, (200..<300).contains(response.statusCode)
+                        else { return }
+                        if let validator = resumeValidator(from: response) {
+                            try? validator.write(to: validatorURL, atomically: true, encoding: .utf8)
+                        } else {
+                            try? FileManager.default.removeItem(at: validatorURL)
+                        }
+                    }
+                )
 
                 if httpResponse.statusCode == 429 || httpResponse.statusCode == 503 {
                     throw HuggingFaceDownloadError.rateLimited(
                         statusCode: httpResponse.statusCode,
                         message: "Rate limited while downloading \(path)")
+                }
+
+                if httpResponse.statusCode == 416 {
+                    // Range not satisfiable — the partial is bogus (or the remote
+                    // shrank). Restart from 0 on the next attempt.
+                    clearPartialDownload(partialURL)
+                    throw HuggingFaceDownloadError.invalidArtifact(
+                        path: path, reason: "server rejected resume range (416)")
                 }
 
                 guard (200..<300).contains(httpResponse.statusCode) else {
@@ -835,11 +922,19 @@ public class DownloadUtils {
                     )
                 }
 
-                // Validate before the caller moves the temp file into the cache.
-                try validateDownloadedArtifact(
-                    at: tempURL, response: httpResponse, path: path, expectedSize: expectedSize)
+                // Validate before the caller moves the file into the cache.
+                do {
+                    try validateDownloadedArtifact(
+                        at: partialURL, response: httpResponse, path: path,
+                        expectedSize: expectedSize)
+                } catch {
+                    // A completed-but-invalid body must not be resumed from.
+                    clearPartialDownload(partialURL)
+                    throw error
+                }
 
-                return tempURL
+                try? FileManager.default.removeItem(at: validatorURL)
+                return partialURL
             } catch {
                 lastError = error
                 guard attempt < maxAttempts, isRetryableDownloadError(error) else {
@@ -1086,28 +1181,44 @@ public class DownloadUtils {
 // MARK: - URLSession download delegate for byte-level progress
 
 /// `URLSessionDownloadTask` → async/await bridge that forwards byte progress (#756).
-private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
+/// Streams response bytes straight into a destination file so partial content
+/// survives connection drops (#757). Appends after `resumeOffset` on HTTP 206;
+/// truncates and writes from 0 on any other 2xx; discards the body otherwise.
+private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate, Sendable {
     private struct State {
-        var continuation: CheckedContinuation<(URL, HTTPURLResponse), Error>?
-        var task: URLSessionDownloadTask?
-        var movedURL: URL?
-        var moveError: Error?
+        var continuation: CheckedContinuation<HTTPURLResponse, Error>?
+        var task: URLSessionDataTask?
+        var handle: FileHandle?
+        var bytesWritten: Int64 = 0
+        var expectedTotal: Int64 = -1
+        var writeError: Error?
         var finished = false
     }
 
-    private let onProgress: @Sendable (Int64, Int64) -> Void
-    // Holds the non-Sendable continuation; the lock (not `@unchecked`) makes the
-    // delegate Sendable as URLSession requires.
+    private let destination: URL
+    private let resumeOffset: Int64
+    private let onProgress: (@Sendable (Int64, Int64) -> Void)?
+    private let onResponse: (@Sendable (HTTPURLResponse) -> Void)?
+    // Holds the non-Sendable continuation and file handle; the lock (not
+    // `@unchecked`) makes the delegate Sendable as URLSession requires.
     private let state = OSAllocatedUnfairLock<State>(uncheckedState: State())
 
-    init(onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+    init(
+        destination: URL,
+        resumeOffset: Int64,
+        onProgress: (@Sendable (Int64, Int64) -> Void)?,
+        onResponse: (@Sendable (HTTPURLResponse) -> Void)?
+    ) {
+        self.destination = destination
+        self.resumeOffset = resumeOffset
         self.onProgress = onProgress
+        self.onResponse = onResponse
     }
 
     /// Register the continuation and task before the task starts.
     func attach(
-        continuation: CheckedContinuation<(URL, HTTPURLResponse), Error>,
-        task: URLSessionDownloadTask
+        continuation: CheckedContinuation<HTTPURLResponse, Error>,
+        task: URLSessionDataTask
     ) {
         state.withLockUnchecked {
             $0.continuation = continuation
@@ -1121,28 +1232,74 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelega
 
     func urlSession(
         _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didWriteData bytesWritten: Int64,
-        totalBytesWritten: Int64,
-        totalBytesExpectedToWrite: Int64
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            return
+        }
+        onResponse?(http)
+
+        // Only 2xx bodies are file content worth keeping; error bodies are
+        // discarded so a 503 page can never overwrite resumable bytes.
+        if (200..<300).contains(http.statusCode) {
+            let appending = http.statusCode == 206
+            do {
+                if !FileManager.default.fileExists(atPath: destination.path) {
+                    FileManager.default.createFile(atPath: destination.path, contents: nil)
+                }
+                let handle = try FileHandle(forWritingTo: destination)
+                if appending {
+                    try handle.seekToEnd()
+                } else {
+                    try handle.truncate(atOffset: 0)
+                }
+                let base = appending ? resumeOffset : 0
+                // Content-Range carries the full object size on a 206; a plain
+                // 200 reports the full size via expectedContentLength.
+                let expectedTotal: Int64
+                if let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+                    let totalPart = contentRange.split(separator: "/").last,
+                    let total = Int64(totalPart)
+                {
+                    expectedTotal = total
+                } else if http.expectedContentLength >= 0 {
+                    expectedTotal = base + http.expectedContentLength
+                } else {
+                    expectedTotal = -1
+                }
+                state.withLockUnchecked {
+                    $0.handle = handle
+                    $0.bytesWritten = base
+                    $0.expectedTotal = expectedTotal
+                }
+            } catch {
+                state.withLockUnchecked { $0.writeError = error }
+                completionHandler(.cancel)
+                return
+            }
+        }
+        completionHandler(.allow)
     }
 
-    func urlSession(
-        _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didFinishDownloadingTo location: URL
-    ) {
-        // URLSession deletes `location` once this returns; move it somewhere
-        // durable now and hand the moved URL back at completion.
-        let durable = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-        do {
-            try FileManager.default.moveItem(at: location, to: durable)
-            state.withLockUnchecked { $0.movedURL = durable }
-        } catch {
-            state.withLockUnchecked { $0.moveError = error }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let progress: (written: Int64, expected: Int64)? = state.withLockUnchecked { st in
+            guard let handle = st.handle, st.writeError == nil else { return nil }
+            do {
+                try handle.write(contentsOf: data)
+                st.bytesWritten += Int64(data.count)
+                return (st.bytesWritten, st.expectedTotal)
+            } catch {
+                st.writeError = error
+                return nil
+            }
+        }
+        if let progress {
+            onProgress?(progress.written, progress.expected)
+        } else if state.withLockUnchecked({ $0.writeError }) != nil {
+            cancel()
         }
     }
 
@@ -1158,15 +1315,16 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelega
             st.finished = true
             st.continuation = nil
             st.task = nil
-            let movedURL = st.movedURL
-            let moveError = st.moveError
+            try? st.handle?.close()
+            st.handle = nil
+            let writeError = st.writeError
             return {
-                if let error {
+                if let writeError {
+                    continuation.resume(throwing: writeError)
+                } else if let error {
                     continuation.resume(throwing: error)
-                } else if let moveError {
-                    continuation.resume(throwing: moveError)
-                } else if let movedURL, let response {
-                    continuation.resume(returning: (movedURL, response))
+                } else if let response {
+                    continuation.resume(returning: response)
                 } else {
                     continuation.resume(throwing: DownloadUtils.HuggingFaceDownloadError.invalidResponse)
                 }
