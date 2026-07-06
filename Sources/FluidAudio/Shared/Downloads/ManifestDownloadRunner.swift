@@ -2,6 +2,7 @@ import Foundation
 import os.lock
 
 struct ManifestDownloadRunner {
+    private static let logger = AppLogger(category: "ManifestDownloadRunner")
     private static let maxConcurrentDownloads = 6
     private static let maxDownloadAttempts = 4
     private static let minRetryBackoff: TimeInterval = 1.0
@@ -63,6 +64,7 @@ struct ManifestDownloadRunner {
         var completedBytes: Int64 = 0
         var completeDestinations = Set<String>()
         var pendingEntries: [ManifestDownloadEntry] = []
+        let startedAt = Date()
 
         for entry in entries {
             if let existingBytes = try existingCompleteBytes(file: entry.file, destinationURL: entry.destinationURL) {
@@ -101,10 +103,19 @@ struct ManifestDownloadRunner {
             pendingEntries.append(entry)
         }
 
+        Self.logger.info(
+            "Manifest download prepared total_files=\(totalFiles) pending_files=\(pendingEntries.count) skipped_files=\(completedFiles) total_known_bytes=\(totalKnownBytes) completed_bytes=\(completedBytes) unknown_sizes=\(hasUnknownSizes) max_concurrent=\(Self.maxConcurrentDownloads)"
+        )
+
         try await downloadPendingEntries(
             pendingEntries,
             progressState: progressState,
             progress: progress
+        )
+        let elapsed = Self.formatElapsed(since: startedAt)
+        let downloadedBytes = progressState.downloadedBytes
+        Self.logger.info(
+            "Manifest download finished total_files=\(totalFiles) downloaded_bytes=\(downloadedBytes) elapsed_s=\(elapsed) average_mbps=\(Self.formatMbps(bytes: downloadedBytes - completedBytes, since: startedAt))"
         )
     }
 
@@ -125,6 +136,10 @@ struct ManifestDownloadRunner {
 
                 group.addTask {
                     let request = try entry.unit.makeRequest(entry.file)
+                    let startedAt = Date()
+                    Self.logger.info(
+                        "Manifest file download starting path=\(entry.file.localRelativePath) bytes=\(entry.file.sizeBytes ?? -1)"
+                    )
                     let result = try await downloadWithTransientRetry(
                         request,
                         destinationURL: entry.destinationURL,
@@ -137,6 +152,9 @@ struct ManifestDownloadRunner {
                                 currentFile: entry.file.localRelativePath
                             ))
                     }
+                    Self.logger.info(
+                        "Manifest file download finished path=\(entry.file.localRelativePath) bytes=\(result.bytesWritten) elapsed_s=\(Self.formatElapsed(since: startedAt)) average_mbps=\(Self.formatMbps(bytes: result.bytesWritten, since: startedAt))"
+                    )
                     return ManifestDownloadCompletion(
                         fileKey: entry.fileKey,
                         currentFile: entry.file.localRelativePath,
@@ -179,6 +197,9 @@ struct ManifestDownloadRunner {
                 }
 
                 let backoffSeconds = pow(2.0, Double(attempt - 1)) * Self.minRetryBackoff
+                Self.logger.warning(
+                    "Retrying file download path=\(destinationURL.lastPathComponent) attempt=\(attempt + 1) backoff_s=\(Self.formatSeconds(backoffSeconds)) error=\(error.localizedDescription)"
+                )
                 try await retrySleep(backoffSeconds)
             }
         }
@@ -188,6 +209,20 @@ struct ManifestDownloadRunner {
 
     private static func defaultRetrySleep(_ seconds: TimeInterval) async throws {
         try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    private static func formatElapsed(since startedAt: Date) -> String {
+        formatSeconds(max(Date().timeIntervalSince(startedAt), 0.001))
+    }
+
+    private static func formatSeconds(_ seconds: TimeInterval) -> String {
+        String(format: "%.2f", seconds)
+    }
+
+    private static func formatMbps(bytes: Int64, since startedAt: Date) -> String {
+        let elapsed = max(Date().timeIntervalSince(startedAt), 0.001)
+        let mbps = Double(max(bytes, 0)) * 8 / elapsed / 1_000_000
+        return String(format: "%.1f", mbps)
     }
 
     private static func isRetryableDownloadError(_ error: Error) -> Bool {
@@ -313,6 +348,12 @@ private final class ManifestDownloadProgressState: Sendable {
             state.completedFiles += 1
             state.completedBytes += max(bytesWritten, 0)
             return makeProgress(state: state, currentFile: currentFile)
+        }
+    }
+
+    var downloadedBytes: Int64 {
+        state.withLock { state in
+            state.completedBytes + state.inProgressBytes.values.reduce(0, +)
         }
     }
 

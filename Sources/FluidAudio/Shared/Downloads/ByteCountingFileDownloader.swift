@@ -2,6 +2,7 @@ import Foundation
 import os.lock
 
 actor ByteCountingFileDownloader {
+    fileprivate static let logger = AppLogger(category: "ByteCountingFileDownloader")
     private static let parallelRangeThresholdBytes: Int64 = 64 * 1024 * 1024
     private static let rangeChunkSizeBytes: Int64 = 16 * 1024 * 1024
     private static let rangeWorkerLimit = 8
@@ -49,17 +50,37 @@ actor ByteCountingFileDownloader {
                 expectedBytes >= Self.parallelRangeThresholdBytes,
                 Self.existingFileSize(at: partialURL) == 0
             {
+                let startedAt = Date()
+                let path = destinationURL.lastPathComponent
+                let ranges = Self.makeRanges(totalBytes: expectedBytes).count
+                let telemetry = ParallelDownloadTelemetry(
+                    path: path,
+                    totalBytes: expectedBytes,
+                    startedAt: startedAt
+                )
+                Self.logger.info(
+                    "Starting parallel download path=\(path) bytes=\(expectedBytes) ranges=\(ranges) workers=\(Self.rangeWorkerLimit)"
+                )
                 do {
-                    return try await performParallelRangeDownload(
+                    let result = try await performParallelRangeDownload(
                         request: request,
                         destinationURL: destinationURL,
                         partialURL: partialURL,
                         expectedBytes: expectedBytes,
+                        telemetry: telemetry,
                         progress: reportProgress
                     )
+                    Self.logger.info(
+                        "Finished parallel download path=\(path) bytes=\(result.bytesWritten) elapsed_s=\(Self.formatElapsed(since: startedAt)) average_mbps=\(Self.formatMbps(bytes: result.bytesWritten, since: startedAt))"
+                    )
+                    return result
                 } catch {
+                    Self.logger.warning(
+                        "Parallel download failed path=\(path) bytes=\(expectedBytes) elapsed_s=\(Self.formatElapsed(since: startedAt)); falling back to single stream: \(error.localizedDescription)"
+                    )
                     try? FileManager.default.removeItem(at: partialURL)
-                    return try await performDownload(
+                    let fallbackStartedAt = Date()
+                    let result = try await performDownload(
                         request: request,
                         destinationURL: destinationURL,
                         partialURL: partialURL,
@@ -67,20 +88,31 @@ actor ByteCountingFileDownloader {
                         resumeOffset: 0,
                         progress: reportProgress
                     )
+                    Self.logger.info(
+                        "Finished fallback single-stream download path=\(path) bytes=\(result.bytesWritten) elapsed_s=\(Self.formatElapsed(since: fallbackStartedAt)) average_mbps=\(Self.formatMbps(bytes: result.bytesWritten, since: fallbackStartedAt))"
+                    )
+                    return result
                 }
             }
 
-            return try await performDownload(
+            let startedAt = Date()
+            let resumeOffset = Self.existingFileSize(at: partialURL)
+            let result = try await performDownload(
                 request: request,
                 destinationURL: destinationURL,
                 partialURL: partialURL,
                 expectedBytes: expectedBytes,
-                resumeOffset: Self.existingFileSize(at: partialURL),
+                resumeOffset: resumeOffset,
                 progress: reportProgress
             )
+            Self.logger.info(
+                "Finished single-stream download path=\(destinationURL.lastPathComponent) bytes=\(result.bytesWritten) resumed=\(result.resumed) resume_offset=\(resumeOffset) elapsed_s=\(Self.formatElapsed(since: startedAt)) average_mbps=\(Self.formatMbps(bytes: max(result.bytesWritten - resumeOffset, 0), since: startedAt))"
+            )
+            return result
         } catch ByteCountingDownloadError.staleRange {
             try? FileManager.default.removeItem(at: partialURL)
-            return try await performDownload(
+            let startedAt = Date()
+            let result = try await performDownload(
                 request: request,
                 destinationURL: destinationURL,
                 partialURL: partialURL,
@@ -88,6 +120,10 @@ actor ByteCountingFileDownloader {
                 resumeOffset: 0,
                 progress: reportProgress
             )
+            Self.logger.info(
+                "Finished stale-range restart path=\(destinationURL.lastPathComponent) bytes=\(result.bytesWritten) elapsed_s=\(Self.formatElapsed(since: startedAt)) average_mbps=\(Self.formatMbps(bytes: result.bytesWritten, since: startedAt))"
+            )
+            return result
         }
     }
 
@@ -96,6 +132,7 @@ actor ByteCountingFileDownloader {
         destinationURL: URL,
         partialURL: URL,
         expectedBytes: Int64,
+        telemetry: ParallelDownloadTelemetry,
         progress: @escaping @Sendable (Int64) -> Void
     ) async throws -> ValidatedDownloadResult {
         let ranges = Self.makeRanges(totalBytes: expectedBytes)
@@ -120,7 +157,9 @@ actor ByteCountingFileDownloader {
                             rangeDirectory: rangeDirectory,
                             expectedTotalBytes: expectedBytes
                         ) { bytes in
-                            progress(rangeProgress.update(rangeIndex: range.index, bytesWritten: bytes))
+                            let downloadedBytes = rangeProgress.update(rangeIndex: range.index, bytesWritten: bytes)
+                            progress(downloadedBytes)
+                            telemetry.report(downloadedBytes: downloadedBytes)
                         }
                     }
                 }
@@ -170,6 +209,7 @@ actor ByteCountingFileDownloader {
             try Self.replaceItem(at: destinationURL, with: partialURL)
             try? FileManager.default.removeItem(at: rangeDirectory)
             progress(expectedBytes)
+            telemetry.report(downloadedBytes: expectedBytes, force: true)
             return ValidatedDownloadResult(finalURL: destinationURL, bytesWritten: expectedBytes, resumed: false)
         } catch {
             try? FileManager.default.removeItem(at: rangeDirectory)
@@ -188,6 +228,7 @@ actor ByteCountingFileDownloader {
         rangeRequest.setValue("bytes=\(range.start)-\(range.end)", forHTTPHeaderField: "Range")
         let destinationURL = rangeDirectory.appendingPathComponent("\(range.index).part")
         let partialURL = Self.partialURL(for: destinationURL)
+        let startedAt = Date()
         let result = try await performDownload(
             request: rangeRequest,
             destinationURL: destinationURL,
@@ -211,6 +252,9 @@ actor ByteCountingFileDownloader {
                 )
             )
         }
+        Self.logger.info(
+            "Finished range download path=\(request.url?.lastPathComponent ?? "range") index=\(range.index) start=\(range.start) end=\(range.end) bytes=\(result.bytesWritten) elapsed_s=\(Self.formatElapsed(since: startedAt)) average_mbps=\(Self.formatMbps(bytes: result.bytesWritten, since: startedAt))"
+        )
     }
 
     private func performDownload(
@@ -277,6 +321,57 @@ actor ByteCountingFileDownloader {
             start = end + 1
         }
         return ranges
+    }
+
+    fileprivate static func formatElapsed(since startedAt: Date) -> String {
+        String(format: "%.2f", max(Date().timeIntervalSince(startedAt), 0.001))
+    }
+
+    fileprivate static func formatMbps(bytes: Int64, since startedAt: Date) -> String {
+        let elapsed = max(Date().timeIntervalSince(startedAt), 0.001)
+        let mbps = Double(max(bytes, 0)) * 8 / elapsed / 1_000_000
+        return String(format: "%.1f", mbps)
+    }
+}
+
+private final class ParallelDownloadTelemetry: Sendable {
+    private struct State {
+        var lastLoggedAt: Date
+        var lastLoggedBytes: Int64
+    }
+
+    private let path: String
+    private let totalBytes: Int64
+    private let startedAt: Date
+    private let state: OSAllocatedUnfairLock<State>
+
+    init(path: String, totalBytes: Int64, startedAt: Date) {
+        self.path = path
+        self.totalBytes = totalBytes
+        self.startedAt = startedAt
+        self.state = OSAllocatedUnfairLock(
+            initialState: State(lastLoggedAt: startedAt, lastLoggedBytes: 0)
+        )
+    }
+
+    func report(downloadedBytes: Int64, force: Bool = false) {
+        let now = Date()
+        let shouldLog = state.withLock { state in
+            let elapsed = now.timeIntervalSince(state.lastLoggedAt)
+            let byteDelta = downloadedBytes - state.lastLoggedBytes
+            guard force || elapsed >= 5 || byteDelta >= 64 * 1024 * 1024 else {
+                return false
+            }
+            state.lastLoggedAt = now
+            state.lastLoggedBytes = downloadedBytes
+            return true
+        }
+        guard shouldLog else { return }
+
+        let percent = Double(max(downloadedBytes, 0)) / Double(max(totalBytes, 1)) * 100
+        ByteCountingFileDownloader.logger.info(
+            "Parallel download progress path=\(path) bytes=\(downloadedBytes)/\(totalBytes) percent=\(String(format: "%.1f", percent)) elapsed_s=\(ByteCountingFileDownloader.formatElapsed(since: startedAt)) average_mbps=\(ByteCountingFileDownloader.formatMbps(bytes: downloadedBytes, since: startedAt))"
+        )
     }
 }
 
