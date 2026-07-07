@@ -1,12 +1,26 @@
 import Foundation
 
-/// HuggingFace HTTP plumbing for the DownloadUtils download paths, converging
-/// here across the #765 waves: token resolution, authorized request building,
-/// and the single place where rate-limit (429/503) responses become typed
-/// errors. (`fetchHuggingFaceFile` keeps its divergent retry loop until
-/// Wave 5; `AssetDownloader` and the CLI's `DatasetDownloader` are not yet in
-/// scope.)
+/// HuggingFace HTTP plumbing for the download stack: the shared configured
+/// session, offline-mode storage, token resolution, authorized request
+/// building, and the single place where rate-limit (429/503) responses
+/// become typed errors. `ModelHub` is the public surface over this.
 enum HFClient {
+
+    /// Shared URLSession with registry and proxy configuration; created
+    /// lazily on first use. `ModelHub.session` is the public spelling.
+    static let session: URLSession = ModelRegistry.configuredSession()
+
+    /// Offline-mode storage; `ModelHub.offlineMode` is the public spelling.
+    /// Set once at startup before any loaders are touched
+    /// (`nonisolated(unsafe)` is acceptable under that contract).
+    nonisolated(unsafe) static var offlineMode: Bool = false
+
+    /// Authenticated data fetch (`ModelHub.fetchWithAuth` is the public
+    /// spelling): authorized request on the shared session.
+    static func fetchWithAuth(from url: URL) async throws -> (Data, URLResponse) {
+        let request = authorizedRequest(url: url)
+        return try await session.data(for: request)
+    }
 
     /// HuggingFace token from the environment, if available. Supports the env
     /// vars used by the official CLI (`HF_TOKEN`), the Python `huggingface_hub`
@@ -20,7 +34,7 @@ enum HFClient {
 
     /// Create a URLRequest with optional auth header and timeout.
     static func authorizedRequest(
-        url: URL, timeout: TimeInterval = HFDownload.Config.default.timeout
+        url: URL, timeout: TimeInterval = DownloadConfig.default.timeout
     ) -> URLRequest {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         if let token = huggingFaceToken {
@@ -30,7 +44,7 @@ enum HFClient {
     }
 
     /// The one place 429/503 responses are turned into
-    /// `HFDownload.DownloadError.rateLimited`. The message is deterministic
+    /// `DownloadError.rateLimited`. The message is deterministic
     /// ("Rate limited while <context> (HTTP <code>)"); the machine-readable
     /// `Retry-After` hint stays available via `retryAfter(from:)` for the
     /// retry layer to honor (Wave 5) rather than being flattened into text.
@@ -38,7 +52,7 @@ enum HFClient {
         _ response: HTTPURLResponse, context: @autoclosure () -> String
     ) throws {
         guard response.statusCode == 429 || response.statusCode == 503 else { return }
-        throw HFDownload.DownloadError.rateLimited(
+        throw DownloadError.rateLimited(
             statusCode: response.statusCode,
             message: "Rate limited while \(context()) (HTTP \(response.statusCode))")
     }
@@ -137,7 +151,7 @@ enum HFClient {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed?.hasPrefix("<") == true || looksLikeHTML(data) {
             let snippet = String((trimmed ?? "").prefix(100))
-            throw HFDownload.DownloadError.htmlErrorResponse(path: path, snippet: snippet)
+            throw DownloadError.htmlErrorResponse(path: path, snippet: snippet)
         }
     }
 }

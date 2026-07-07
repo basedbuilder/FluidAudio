@@ -39,7 +39,7 @@ public enum PocketTtsResourceDownloader {
         directory: URL? = nil,
         precision: PocketTtsPrecision = .fp16,
         placement: PocketTtsModelPlacement = .gpu,
-        progressHandler: DownloadUtils.ProgressHandler? = nil
+        progressHandler: ProgressHandler? = nil
     ) async throws -> URL {
         let targetDir = try directory ?? cacheDirectory()
         let modelsDirectory = targetDir.appendingPathComponent(
@@ -83,7 +83,7 @@ public enum PocketTtsResourceDownloader {
         logger.info(
             "Downloading PocketTTS \(language.rawValue) (\(precision)) language pack from HuggingFace (\(subdir))..."
         )
-        try await DownloadUtils.downloadSubdirectory(
+        try await ModelHub.download(
             .pocketTts,
             subdirectory: subdir,
             to: repoDir,
@@ -142,7 +142,7 @@ public enum PocketTtsResourceDownloader {
 
     /// Backfill `constants_bin/bos_before_voice.bin` for cached language packs
     /// that were downloaded before the FluidAudio #592 fix. New downloads pick
-    /// it up via `downloadSubdirectory` — this helper exists only to upgrade
+    /// it up via `download(subdirectory:)` — this helper exists only to upgrade
     /// older caches without a full re-download.
     private static func ensureBosBeforeVoice(
         language: PocketTtsLanguage,
@@ -226,7 +226,7 @@ public enum PocketTtsResourceDownloader {
             at: repoDir, withIntermediateDirectories: true)
 
         logger.info("Downloading Mimi encoder for voice cloning...")
-        try await DownloadUtils.downloadSubdirectory(
+        try await ModelHub.download(
             .pocketTts,
             subdirectory: ModelNames.PocketTTS.mimiEncoderFile,
             to: repoDir

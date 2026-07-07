@@ -3,7 +3,7 @@ import XCTest
 
 @testable import FluidAudio
 
-/// Characterization tests for `downloadRepo`'s file-selection rules (#765
+/// Characterization tests for `ModelHub.download`'s file-selection rules (#765
 /// Wave 1). These pin CURRENT behavior — quirks included — so the Wave 3
 /// lister extraction can prove the rules moved verbatim. They are not a
 /// statement of what the rules *should* be; deliberate changes belong in a
@@ -84,7 +84,7 @@ final class DownloadFilterCharacterizationTests: XCTestCase {
         ]
         TreeStubURLProtocol.fileBody = body(10)
 
-        try await DownloadUtils.downloadRepo(
+        try await ModelHub.download(
             .vad, to: workDir, configuration: stubConfiguration)
 
         // Pinned: required-model subtree + root .json/.txt come down;
@@ -139,7 +139,7 @@ final class DownloadFilterCharacterizationTests: XCTestCase {
         ]
         TreeStubURLProtocol.fileBody = body(10)
 
-        try await DownloadUtils.downloadRepo(
+        try await ModelHub.download(
             .parakeetEou160, to: workDir, configuration: stubConfiguration)
 
         // Pinned: subPath prefix is stripped locally; .json/.model/.bin under the
@@ -199,10 +199,10 @@ final class DownloadFilterCharacterizationTests: XCTestCase {
         TreeStubURLProtocol.fileBody = body(10)
 
         do {
-            try await DownloadUtils.downloadRepo(
+            try await ModelHub.download(
                 .kokoroAneZh, to: workDir, configuration: stubConfiguration)
             XCTFail("expected modelNotFound for the missing voice")
-        } catch DownloadUtils.HuggingFaceDownloadError.modelNotFound(let path) {
+        } catch DownloadError.modelNotFound(let path) {
             XCTAssertEqual(path, voice)
         }
 
@@ -241,7 +241,7 @@ final class DownloadFilterCharacterizationTests: XCTestCase {
         ]
         TreeStubURLProtocol.fileBody = body(10)
 
-        try await DownloadUtils.downloadRepo(
+        try await ModelHub.download(
             .parakeetCtc110m, to: workDir,
             additionalModelNames: ["CtcHead.mlmodelc"],
             configuration: stubConfiguration)

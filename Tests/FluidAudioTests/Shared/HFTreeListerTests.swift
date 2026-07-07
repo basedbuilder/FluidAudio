@@ -7,7 +7,7 @@ import XCTest
 /// include-based pruning, Link-header pagination (confirmed against the live
 /// HF API in Wave 0), and typed errors for rate-limit/HTML/malformed pages.
 /// The repo-specific filter *rules* are pinned separately by
-/// `DownloadFilterCharacterizationTests` through `downloadRepo`.
+/// `DownloadFilterCharacterizationTests` through `ModelHub.download`.
 final class HFTreeListerTests: XCTestCase {
 
     private static let repo = "FluidInference/test-repo"
@@ -41,7 +41,7 @@ final class HFTreeListerTests: XCTestCase {
             { url in
                 self.requested.append(url.absoluteString)
                 guard let page = self.pages[url.absoluteString] else {
-                    throw HFDownload.DownloadError.invalidResponse
+                    throw DownloadError.invalidResponse
                 }
                 return page
             }
@@ -175,7 +175,7 @@ final class HFTreeListerTests: XCTestCase {
 
     // MARK: - Pagination through the real fetch path
 
-    /// End-to-end: downloadRepo → configuration seam → HFTreeLister.fetch →
+    /// End-to-end: ModelHub.download → configuration seam → HFTreeLister.fetch →
     /// URLSession → Link cursor. The unit tests above bypass the session via
     /// an injected Fetch; this pins the production wiring.
     func testDownloadRepoFollowsPaginationThroughRealFetchPath() async throws {
@@ -205,7 +205,7 @@ final class HFTreeListerTests: XCTestCase {
 
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [LinkedTreeStubURLProtocol.self]
-        try await DownloadUtils.downloadRepo(.vad, to: workDir, configuration: config)
+        try await ModelHub.download(.vad, to: workDir, configuration: config)
 
         let repoPath = workDir.appendingPathComponent(Repo.vad.folderName)
         XCTAssertTrue(
@@ -227,7 +227,7 @@ final class HFTreeListerTests: XCTestCase {
             _ = try await HFTreeLister.listTree(
                 repoRemotePath: Self.repo, include: { _, _ in true }, fetch: server.fetch)
             XCTFail("expected rateLimited")
-        } catch HFDownload.DownloadError.rateLimited(let statusCode, _) {
+        } catch DownloadError.rateLimited(let statusCode, _) {
             XCTAssertEqual(statusCode, 429)
         }
     }
@@ -240,7 +240,7 @@ final class HFTreeListerTests: XCTestCase {
             _ = try await HFTreeLister.listTree(
                 repoRemotePath: Self.repo, include: { _, _ in true }, fetch: server.fetch)
             XCTFail("expected htmlErrorResponse")
-        } catch HFDownload.DownloadError.htmlErrorResponse {
+        } catch DownloadError.htmlErrorResponse {
             // expected
         }
     }
@@ -253,7 +253,7 @@ final class HFTreeListerTests: XCTestCase {
             _ = try await HFTreeLister.listTree(
                 repoRemotePath: Self.repo, include: { _, _ in true }, fetch: server.fetch)
             XCTFail("expected invalidResponse")
-        } catch HFDownload.DownloadError.invalidResponse {
+        } catch DownloadError.invalidResponse {
             // expected
         }
     }

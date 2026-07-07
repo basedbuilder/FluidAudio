@@ -1,9 +1,9 @@
 import Foundation
 
-/// The retry policy the DownloadUtils download paths converge on across the
-/// #765 waves (#765 Wave 2): bounded exponential backoff on transient
-/// failures, fail-fast on permanent ones. `fetchHuggingFaceFile` still runs
-/// its historical retry-everything loop and converges in Wave 5.
+/// The single retry policy for the download stack: bounded exponential
+/// backoff on transient failures (paced by a server `Retry-After` when one
+/// is provided), fail-fast on permanent ones. Every network path —
+/// `ModelHub.loadModels`/`download`/`fetchFile` — retries through here.
 enum RetryPolicy {
 
     private static let defaultLogger = AppLogger(category: "RetryPolicy")
@@ -89,12 +89,12 @@ enum RetryPolicy {
         }
 
         switch error {
-        case HFDownload.DownloadError.rateLimited:
+        case DownloadError.rateLimited:
             return true
-        case HFDownload.DownloadError.invalidArtifact:
+        case DownloadError.invalidArtifact:
             // Usually a transient unhealthy network path (proxy, mirror 5xx) — retry.
             return true
-        case HFDownload.DownloadError.downloadFailed(_, let underlying):
+        case DownloadError.downloadFailed(_, let underlying):
             let nsError = underlying as NSError
             return nsError.domain == "HTTP" && (500...599).contains(nsError.code)
         default:

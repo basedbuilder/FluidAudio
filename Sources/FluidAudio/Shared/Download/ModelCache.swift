@@ -2,13 +2,13 @@ import Foundation
 
 /// On-disk model-cache knowledge for the download stack (#765 Wave 4):
 /// existence/completeness checks, corrupt-cache purging, robust directory
-/// creation, and the cache-clearing operations behind the DownloadUtils
+/// creation, and the cache-clearing operations behind the ModelHub
 /// public API.
 enum ModelCache {
 
-    /// Historical category kept so existing log predicates keep capturing the
-    /// whole download trail across the #765 refactor; Wave 6 renames it
-    /// deliberately alongside the API cutover.
+    /// Historical log category retained deliberately across the 0.16 rename so
+    /// existing `category == "DownloadUtils"` predicates keep capturing the
+    /// whole download trail; renaming it is a separate, opt-in decision.
     private static let logger = AppLogger(category: "DownloadUtils")
 
     /// Robustly create a directory, removing any conflicting files in the path.
@@ -75,7 +75,7 @@ enum ModelCache {
     /// required model absent under `repoPath` — the post-download verify pass.
     static func verifyModelsPresent(at repoPath: URL, models: Set<String>) throws {
         if let missing = missingModels(at: repoPath, models: models).first {
-            throw HFDownload.DownloadError.modelNotFound(path: missing)
+            throw DownloadError.modelNotFound(path: missing)
         }
     }
 

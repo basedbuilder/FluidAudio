@@ -8,8 +8,8 @@ struct RemoteFile: Equatable, Sendable {
 }
 
 /// The one tree-listing implementation for the download stack (#765 Wave 3),
-/// replacing the two divergent recursive walkers in `downloadRepo` and
-/// `downloadSubdirectory`. Follows the HF tree API's `Link` pagination cursor,
+/// replacing the two divergent recursive walkers in `ModelHub.download` and
+/// `download(subdirectory:)`. Follows the HF tree API's `Link` pagination cursor,
 /// so directories with more entries than one API page (1,000 by default) no
 /// longer silently drop files.
 enum HFTreeLister {
@@ -21,19 +21,19 @@ enum HFTreeLister {
     typealias Fetch = (URL) async throws -> (Data, HTTPURLResponse)
 
     /// Production fetch: authorized request on `session`, re-checking
-    /// `enforceOffline` per request so flipping the flag mid-listing stops the
+    /// `offlineMode` per request so flipping the flag mid-listing stops the
     /// walk at the next fetch. Non-HTTP responses are rejected as
     /// `invalidResponse` — an explicit decision; the old listers silently
     /// skipped the rate-limit check on non-HTTP responses.
     static func fetch(using session: URLSession) -> Fetch {
         { url in
-            guard !DownloadUtils.enforceOffline else {
-                throw DownloadUtils.OfflineError.networkDisabled(operation: "listTree(\(url.path))")
+            guard !HFClient.offlineMode else {
+                throw DownloadError.networkDisabled(operation: "listTree(\(url.path))")
             }
             let request = HFClient.authorizedRequest(url: url)
             let (data, response) = try await session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
-                throw HFDownload.DownloadError.invalidResponse
+                throw DownloadError.invalidResponse
             }
             return (data, httpResponse)
         }
@@ -73,7 +73,7 @@ enum HFTreeLister {
                 context: path.isEmpty ? "listing files" : "listing files in \(path)")
             try HFClient.validateJSONResponse(data, path: path)
             guard let items = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                throw HFDownload.DownloadError.invalidResponse
+                throw DownloadError.invalidResponse
             }
 
             for item in items {

@@ -387,8 +387,8 @@ final class AsrModelsTests: XCTestCase {
     /// `CtcHead.mlmodelc` from the `parakeet-ctc-110m` repo, but that repo's
     /// default required set is the standalone CTC frontend
     /// (`MelSpectrogram` + `AudioEncoder`) and does NOT include the CTC head.
-    /// `DownloadUtils.loadModels` threads the caller's `modelNames` into
-    /// `downloadRepo` via `additionalModelNames` so the HF filter recurses
+    /// `ModelHub.loadModels` threads the caller's `modelNames` into
+    /// `ModelHub.download` via `additionalModelNames` so the HF filter recurses
     /// into the `CtcHead.mlmodelc/` directory.
     func testParakeetCtc110mRequiredSetExcludesCtcHead() {
         let required = ModelNames.getRequiredModelNames(for: .parakeetCtc110m, variant: nil)
@@ -397,13 +397,13 @@ final class AsrModelsTests: XCTestCase {
         XCTAssertFalse(
             required.contains(ModelNames.ASR.ctcHeadFile),
             "CtcHead must not be in the parakeet-ctc-110m baseline required set; "
-                + "callers needing it must pass it via DownloadUtils.loadModels' "
+                + "callers needing it must pass it via ModelHub.loadModels' "
                 + "modelNames parameter."
         )
     }
 
     /// Verifies that the cache-validity check in `loadModelsOnce` (and the
-    /// matching filter in `downloadRepo`) sees `CtcHead.mlmodelc` as
+    /// matching filter in `ModelHub.download`) sees `CtcHead.mlmodelc` as
     /// missing even when the baseline required set is fully present on
     /// disk. Pre-fix, the local cache check returned `true` here and the
     /// download was skipped, leading to a silent `fileNoSuchFile` in the
