@@ -8,6 +8,21 @@ enum RetryPolicy {
 
     private static let defaultLogger = AppLogger(category: "RetryPolicy")
 
+    /// Longest server-requested pause `withRetry` will honor. Rate-limited
+    /// endpoints occasionally send hour-scale `Retry-After` values; waiting
+    /// that long inside a download call would look like a hang.
+    static let maxHonoredRetryAfter: TimeInterval = 30
+
+    /// Internal envelope carrying a typed `Retry-After` hint alongside the
+    /// real error (#765 Wave 5). Thrown ONLY inside `withRetry` operations
+    /// (see `HFClient.checkRateLimitForRetry`); `withRetry` unwraps it for
+    /// pacing and always rethrows the underlying error, so the envelope never
+    /// escapes to callers or tests.
+    struct RetryAfterHint: Error {
+        let underlying: Error
+        let retryAfter: TimeInterval
+    }
+
     /// Run `operation`, retrying transient failures (per `isRetryable`) with
     /// exponential backoff. Permanent errors and the final attempt's error are
     /// rethrown unchanged. The closure receives the 1-based attempt number
@@ -31,14 +46,23 @@ enum RetryPolicy {
             do {
                 return try await operation(attempt)
             } catch {
-                guard attempt < maxAttempts, isRetryable(error) else {
-                    throw error
+                // Unwrap a Retry-After envelope: the hint paces the sleep, the
+                // underlying error drives classification and is what callers
+                // see — the envelope never escapes this function.
+                let hint = error as? RetryAfterHint
+                let underlying = hint?.underlying ?? error
+
+                guard attempt < maxAttempts, isRetryable(underlying) else {
+                    throw underlying
                 }
                 let backoffSeconds = pow(2.0, Double(attempt - 1)) * minBackoff
+                let serverPause = min(hint?.retryAfter ?? 0, maxHonoredRetryAfter)
+                let pauseSeconds = max(backoffSeconds, serverPause)
+                let pacedNote = serverPause > backoffSeconds ? " (server Retry-After)" : ""
                 logger.warning(
-                    "Download attempt \(attempt) for \(label) failed: \(error.localizedDescription). Retrying in \(String(format: "%.1f", backoffSeconds))s."
+                    "Download attempt \(attempt) for \(label) failed: \(underlying.localizedDescription). Retrying in \(String(format: "%.1f", pauseSeconds))s\(pacedNote)."
                 )
-                try await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
+                try await Task.sleep(nanoseconds: UInt64(pauseSeconds * 1_000_000_000))
             }
         }
 

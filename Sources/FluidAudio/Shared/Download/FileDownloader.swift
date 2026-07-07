@@ -118,6 +118,73 @@ enum FileDownloader {
         }
     }
 
+    // MARK: - Small-file fetch with converged policy (#765 Wave 5)
+
+    /// Fetch a small file into memory with the converged policy (#765 Wave 5):
+    /// classified retry (permanent 4xx fails fast, 5xx/rate-limits retry with
+    /// Retry-After pacing) and artifact validation (HTML error pages and empty
+    /// bodies are rejected, never returned as content). Replaces
+    /// `fetchHuggingFaceFile`'s historical retry-everything loop.
+    static func fetchData(
+        from url: URL,
+        description: String,
+        maxAttempts: Int = 4,
+        minBackoff: TimeInterval = 1.0,
+        configuration: URLSessionConfiguration? = nil
+    ) async throws -> Data {
+        let request = HFClient.authorizedRequest(url: url)
+        let session = configuration.map { URLSession(configuration: $0) } ?? DownloadUtils.sharedSession
+        defer {
+            if configuration != nil { session.finishTasksAndInvalidate() }
+        }
+
+        return try await RetryPolicy.withRetry(
+            label: description, maxAttempts: maxAttempts, minBackoff: minBackoff, logger: logger
+        ) { _ in
+            // Re-check per attempt, matching download(): flipping
+            // enforceOffline mid-operation stops at the next request.
+            guard !DownloadUtils.enforceOffline else {
+                throw DownloadUtils.OfflineError.networkDisabled(
+                    operation: "fetchHuggingFaceFile(\(description))")
+            }
+
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw HFDownload.DownloadError.invalidResponse
+            }
+
+            try HFClient.checkRateLimitForRetry(httpResponse, context: "fetching \(description)")
+
+            guard (200..<300).contains(httpResponse.statusCode) else {
+                throw HFDownload.DownloadError.downloadFailed(
+                    path: description,
+                    underlying: NSError(domain: "HTTP", code: httpResponse.statusCode)
+                )
+            }
+
+            // Reject bodies that are error pages or truncated-to-nothing —
+            // a 200 carrying HTML must never be cached as content (#748).
+            // Content-Type check mirrors validateDownloadedArtifact's, so a
+            // text/html page without a sniffable prefix is caught here too.
+            if let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
+                contentType.contains("text/html")
+            {
+                throw HFDownload.DownloadError.invalidArtifact(
+                    path: description, reason: "server returned Content-Type: \(contentType)")
+            }
+            if data.isEmpty {
+                throw HFDownload.DownloadError.invalidArtifact(
+                    path: description, reason: "empty file")
+            }
+            if HFClient.looksLikeHTML(data) {
+                throw HFDownload.DownloadError.invalidArtifact(
+                    path: description, reason: "response body begins with HTML markup")
+            }
+
+            return data
+        }
+    }
+
     // MARK: - Streaming download to a persistent file
 
     /// Stream a download directly into `destination` so received bytes survive
@@ -290,7 +357,7 @@ enum FileDownloader {
                 }
             )
 
-            try HFClient.checkRateLimit(httpResponse, context: "downloading \(path)")
+            try HFClient.checkRateLimitForRetry(httpResponse, context: "downloading \(path)")
 
             if httpResponse.statusCode == 416 {
                 // Range not satisfiable — the partial is bogus (or the remote
