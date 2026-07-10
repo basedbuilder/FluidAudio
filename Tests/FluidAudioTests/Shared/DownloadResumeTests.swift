@@ -273,6 +273,144 @@ final class DownloadResumeTests: XCTestCase {
         XCTAssertEqual(events.last?.written, Int64(body.count))
         XCTAssertEqual(events.last?.expected, Int64(body.count))
     }
+
+    func testLargeFreshDownloadUsesValidatedParallelRanges() async throws {
+        let body = Data((0..<97).map { UInt8($0) })
+        let expectedRanges = stride(from: 0, to: body.count, by: 16).map { start in
+            "bytes=\(start)-\(min(start + 15, body.count - 1))"
+        }
+        for _ in expectedRanges {
+            ResumeStubURLProtocol.enqueue(
+                .init(
+                    status: 200,
+                    headers: ["ETag": "\"model-v1\""],
+                    chunks: [],
+                    rangeAwareBody: body))
+        }
+
+        let recorded = ProgressRecorder()
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "large-model.bin",
+            expectedSize: body.count,
+            partialFileURL: partialURL("large-model.bin"),
+            onProgress: { written, expected in recorded.append((written, expected)) },
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            configuration: stubConfiguration,
+            parallelRanges: .init(threshold: 64, chunkSize: 16, maxConcurrent: 3)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().compactMap {
+                $0.value(forHTTPHeaderField: "Range")
+            }.sorted(),
+            expectedRanges.sorted()
+        )
+        let events = recorded.snapshot()
+        XCTAssertEqual(events.last?.written, Int64(body.count))
+        XCTAssertEqual(events.last?.expected, Int64(body.count))
+        XCTAssertEqual(events.map(\.written), events.map(\.written).sorted())
+    }
+
+    func testParallelRangeUnsupportedFallsBackToResumableSingleStream() async throws {
+        let body = Data(repeating: 0x42, count: 97)
+        for _ in 0..<2 {
+            ResumeStubURLProtocol.enqueue(
+                .init(
+                    status: 200,
+                    headers: ["ETag": "\"model-v1\""],
+                    chunks: [body]))
+        }
+
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "range-unsupported.bin",
+            expectedSize: body.count,
+            partialFileURL: partialURL("range-unsupported.bin"),
+            onProgress: nil,
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            configuration: stubConfiguration,
+            parallelRanges: .init(threshold: 64, chunkSize: 128, maxConcurrent: 1)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        let requests = ResumeStubURLProtocol.recordedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Range"), "bytes=0-96")
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "Range"))
+    }
+
+    func testParallelRangesRejectMismatchedValidators() async throws {
+        let body = Data((0..<97).map { UInt8($0) })
+        for validator in ["\"model-v1\"", "\"model-v2\""] {
+            ResumeStubURLProtocol.enqueue(
+                .init(
+                    status: 200,
+                    headers: ["ETag": validator],
+                    chunks: [],
+                    rangeAwareBody: body))
+        }
+        let partial = partialURL("mismatched-validator.bin")
+
+        do {
+            _ = try await FileDownloader.download(
+                request: request,
+                path: "mismatched-validator.bin",
+                expectedSize: body.count,
+                partialFileURL: partial,
+                onProgress: nil,
+                maxAttempts: 1,
+                minBackoff: 0.01,
+                configuration: stubConfiguration,
+                parallelRanges: .init(threshold: 64, chunkSize: 64, maxConcurrent: 1)
+            )
+            XCTFail("expected mismatched validators to fail")
+        } catch DownloadError.invalidArtifact(_, let reason) {
+            XCTAssertEqual(reason, "parallel range validators did not match")
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: partial.appendingPathExtension("ranges").path))
+    }
+
+    func testLargeExistingPartialUsesNormalResumablePath() async throws {
+        let body = Data((0..<97).map { UInt8($0) })
+        let partial = partialURL("large-resume.bin")
+        try Data(body.prefix(10)).write(to: partial)
+        try "\"model-v1\"".write(
+            to: FileDownloader.resumeValidatorURL(for: partial),
+            atomically: true,
+            encoding: .utf8
+        )
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"model-v1\""],
+                chunks: [],
+                rangeAwareBody: body))
+
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "large-resume.bin",
+            expectedSize: body.count,
+            partialFileURL: partial,
+            onProgress: nil,
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            configuration: stubConfiguration,
+            parallelRanges: .init(threshold: 64, chunkSize: 16, maxConcurrent: 3)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        let requests = ResumeStubURLProtocol.recordedRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Range"), "bytes=10-")
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "If-Range"), "\"model-v1\"")
+    }
 }
 
 // MARK: - Scripted URLProtocol stub
@@ -388,24 +526,31 @@ final class ResumeStubURLProtocol: URLProtocol {
     /// Behave like a real range-capable server for `body`: 206 + slice when
     /// the request carries `Range: bytes=N-`, else 200 + the full body.
     private func respondRangeAware(url: URL, body: Data, headers: [String: String]) {
-        var offset = 0
-        if let range = request.value(forHTTPHeaderField: "Range"),
-            range.hasPrefix("bytes="), range.hasSuffix("-"),
-            let start = Int(range.dropFirst("bytes=".count).dropLast()),
-            start > 0, start < body.count
-        {
-            offset = start
+        var start = 0
+        var end = body.count - 1
+        var isRangeRequest = false
+        if let range = request.value(forHTTPHeaderField: "Range"), range.hasPrefix("bytes=") {
+            let bounds = range.dropFirst("bytes=".count).split(
+                separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            if bounds.count == 2,
+                let requestedStart = Int(bounds[0]),
+                let requestedEnd = bounds[1].isEmpty ? body.count - 1 : Int(bounds[1]),
+                requestedStart >= 0,
+                requestedStart <= requestedEnd,
+                requestedEnd < body.count
+            {
+                start = requestedStart
+                end = requestedEnd
+                isRangeRequest = true
+            }
         }
 
         var responseHeaders = headers
-        let payload = body.suffix(from: offset)
+        let payload = body[start...end]
         responseHeaders["Content-Length"] = String(payload.count)
-        let status: Int
-        if offset > 0 {
-            status = 206
-            responseHeaders["Content-Range"] = "bytes \(offset)-\(body.count - 1)/\(body.count)"
-        } else {
-            status = 200
+        let status = isRangeRequest ? 206 : 200
+        if isRangeRequest {
+            responseHeaders["Content-Range"] = "bytes \(start)-\(end)/\(body.count)"
         }
         guard
             let response = HTTPURLResponse(

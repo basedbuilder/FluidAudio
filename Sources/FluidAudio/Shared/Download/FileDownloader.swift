@@ -12,6 +12,80 @@ enum FileDownloader {
     /// whole download trail; renaming it is a separate, opt-in decision.
     private static let logger = AppLogger(category: "DownloadUtils")
 
+    struct ParallelRangeConfiguration: Sendable {
+        let threshold: Int
+        let chunkSize: Int
+        let maxConcurrent: Int
+
+        static let `default` = ParallelRangeConfiguration(
+            threshold: 64 * 1024 * 1024,
+            chunkSize: 16 * 1024 * 1024,
+            maxConcurrent: 8
+        )
+    }
+
+    private struct ParallelRange: Sendable {
+        let index: Int
+        let start: Int
+        let end: Int
+
+        var byteCount: Int { end - start + 1 }
+    }
+
+    private enum ParallelRangeError: LocalizedError {
+        case unsupported(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .unsupported(let reason):
+                return "Parallel byte ranges are unavailable: \(reason)"
+            }
+        }
+    }
+
+    private struct ParallelRangeTaskOutcome: @unchecked Sendable {
+        let index: Int
+        let error: Error?
+    }
+
+    private final class ParallelRangeState: Sendable {
+        private struct State {
+            var bytesByRange: [Int64]
+            var validator: String?
+        }
+
+        private let expectedBytes: Int64
+        private let progress: (@Sendable (Int64, Int64) -> Void)?
+        private let state: OSAllocatedUnfairLock<State>
+
+        init(rangeCount: Int, expectedBytes: Int64, progress: (@Sendable (Int64, Int64) -> Void)?) {
+            self.expectedBytes = expectedBytes
+            self.progress = progress
+            self.state = OSAllocatedUnfairLock(
+                initialState: State(bytesByRange: Array(repeating: 0, count: rangeCount)))
+        }
+
+        func record(range: ParallelRange, bytesWritten: Int64) {
+            state.withLock { state in
+                state.bytesByRange[range.index] = max(
+                    state.bytesByRange[range.index],
+                    min(max(bytesWritten, 0), Int64(range.byteCount))
+                )
+                progress?(state.bytesByRange.reduce(0, +), expectedBytes)
+            }
+        }
+
+        func accept(validator: String, path: String) throws {
+            try state.withLock { state in
+                if let existing = state.validator, existing != validator {
+                    throw DownloadError.invalidArtifact(
+                        path: path, reason: "parallel range validators did not match")
+                }
+                state.validator = validator
+            }
+        }
+    }
+
     /// What `ensure(file:from:at:)` did for a file.
     enum Outcome {
         /// Destination already existed; nothing fetched.
@@ -208,13 +282,15 @@ enum FileDownloader {
         resumeOffset: Int64 = 0,
         configuration: URLSessionConfiguration? = nil,
         onProgress: (@Sendable (Int64, Int64) -> Void)? = nil,
-        onResponse: (@Sendable (HTTPURLResponse) -> Void)? = nil
+        onResponse: (@Sendable (HTTPURLResponse) -> Void)? = nil,
+        validateResponse: (@Sendable (HTTPURLResponse) throws -> Void)? = nil
     ) async throws -> HTTPURLResponse {
         let delegate = StreamingDownloadDelegate(
             destination: destination,
             resumeOffset: resumeOffset,
             onProgress: onProgress,
-            onResponse: onResponse
+            onResponse: onResponse,
+            validateResponse: validateResponse
         )
         // Dedicated session with delegate — one per download to avoid cross-talk.
         // One session per download to avoid delegate cross-talk; the
@@ -290,13 +366,38 @@ enum FileDownloader {
         onProgress: (@Sendable (Int64, Int64) -> Void)?,
         maxAttempts: Int = 4,
         minBackoff: TimeInterval = 1.0,
-        configuration: URLSessionConfiguration? = nil
+        configuration: URLSessionConfiguration? = nil,
+        parallelRanges: ParallelRangeConfiguration = .default
     ) async throws -> URL {
+        precondition(parallelRanges.threshold > 0)
+        precondition(parallelRanges.chunkSize > 0)
+        precondition(parallelRanges.maxConcurrent > 0)
+
         let defaultPartialURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("partial")
         let partialURL = partialFileURL ?? defaultPartialURL
         let validatorURL = resumeValidatorURL(for: partialURL)
+
+        if expectedSize >= parallelRanges.threshold, fileSize(at: partialURL) == 0 {
+            do {
+                return try await downloadInParallelRanges(
+                    request: request,
+                    path: path,
+                    expectedSize: expectedSize,
+                    partialURL: partialURL,
+                    validatorURL: validatorURL,
+                    onProgress: onProgress,
+                    maxAttempts: maxAttempts,
+                    minBackoff: minBackoff,
+                    configuration: configuration,
+                    rangeConfiguration: parallelRanges
+                )
+            } catch ParallelRangeError.unsupported(let reason) {
+                logger.warning(
+                    "Parallel ranges unavailable for \(path); using resumable single stream: \(reason)")
+            }
+        }
 
         return try await RetryPolicy.withRetry(
             label: path, maxAttempts: maxAttempts, minBackoff: minBackoff, logger: logger
@@ -389,6 +490,216 @@ enum FileDownloader {
             return partialURL
         }
     }
+
+    private static func downloadInParallelRanges(
+        request: URLRequest,
+        path: String,
+        expectedSize: Int,
+        partialURL: URL,
+        validatorURL: URL,
+        onProgress: (@Sendable (Int64, Int64) -> Void)?,
+        maxAttempts: Int,
+        minBackoff: TimeInterval,
+        configuration: URLSessionConfiguration?,
+        rangeConfiguration: ParallelRangeConfiguration
+    ) async throws -> URL {
+        guard !HFClient.offlineMode else {
+            throw DownloadError.networkDisabled(operation: "download(\(path))")
+        }
+
+        let ranges = makeParallelRanges(
+            totalBytes: expectedSize, chunkSize: rangeConfiguration.chunkSize)
+        let rangeDirectory = partialURL.appendingPathExtension("ranges")
+        try? FileManager.default.removeItem(at: rangeDirectory)
+        try FileManager.default.createDirectory(at: rangeDirectory, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: validatorURL)
+        defer { try? FileManager.default.removeItem(at: rangeDirectory) }
+
+        logger.info(
+            "Starting parallel range download for \(path): \(ranges.count) ranges, "
+                + "max concurrent \(rangeConfiguration.maxConcurrent)")
+        let progressState = ParallelRangeState(
+            rangeCount: ranges.count,
+            expectedBytes: Int64(expectedSize),
+            progress: onProgress
+        )
+
+        let failures: [ParallelRangeTaskOutcome] = await withTaskGroup(
+            of: ParallelRangeTaskOutcome.self
+        ) { group in
+            var failures: [ParallelRangeTaskOutcome] = []
+            var nextIndex = 0
+            var stopped = false
+
+            func scheduleNext() {
+                guard !stopped, nextIndex < ranges.count else { return }
+                let range = ranges[nextIndex]
+                nextIndex += 1
+                group.addTask {
+                    do {
+                        try await downloadParallelRange(
+                            range,
+                            request: request,
+                            path: path,
+                            expectedSize: expectedSize,
+                            rangeDirectory: rangeDirectory,
+                            progressState: progressState,
+                            maxAttempts: maxAttempts,
+                            minBackoff: minBackoff,
+                            configuration: configuration
+                        )
+                        return ParallelRangeTaskOutcome(index: range.index, error: nil)
+                    } catch {
+                        return ParallelRangeTaskOutcome(index: range.index, error: error)
+                    }
+                }
+            }
+
+            for _ in 0..<min(rangeConfiguration.maxConcurrent, ranges.count) {
+                scheduleNext()
+            }
+
+            while let outcome = await group.next() {
+                if outcome.error != nil {
+                    failures.append(outcome)
+                    if !stopped {
+                        stopped = true
+                        group.cancelAll()
+                    }
+                }
+                scheduleNext()
+            }
+            return failures
+        }
+
+        if !failures.isEmpty {
+            let ordered = failures.sorted { $0.index < $1.index }
+            let selected = ordered.first { outcome in
+                guard let error = outcome.error else { return false }
+                return !RetryPolicy.isCancellation(error)
+            } ?? ordered[0]
+            throw selected.error!
+        }
+
+        if FileManager.default.fileExists(atPath: partialURL.path) {
+            try FileManager.default.removeItem(at: partialURL)
+        }
+        FileManager.default.createFile(atPath: partialURL.path, contents: nil)
+        let output = try FileHandle(forWritingTo: partialURL)
+        defer { try? output.close() }
+        for range in ranges {
+            let rangeURL = rangeDirectory.appendingPathComponent("\(range.index).part")
+            let input = try FileHandle(forReadingFrom: rangeURL)
+            while true {
+                let data = try input.read(upToCount: 1 * 1024 * 1024) ?? Data()
+                guard !data.isEmpty else { break }
+                try output.write(contentsOf: data)
+            }
+            try input.close()
+        }
+        try output.synchronize()
+
+        try validateDownloadedArtifact(
+            at: partialURL, response: nil, path: path, expectedSize: expectedSize)
+        onProgress?(Int64(expectedSize), Int64(expectedSize))
+        logger.info("Finished parallel range download for \(path)")
+        return partialURL
+    }
+
+    private static func downloadParallelRange(
+        _ range: ParallelRange,
+        request: URLRequest,
+        path: String,
+        expectedSize: Int,
+        rangeDirectory: URL,
+        progressState: ParallelRangeState,
+        maxAttempts: Int,
+        minBackoff: TimeInterval,
+        configuration: URLSessionConfiguration?
+    ) async throws {
+        var rangeRequest = request
+        rangeRequest.setValue("bytes=\(range.start)-\(range.end)", forHTTPHeaderField: "Range")
+        let destination = rangeDirectory.appendingPathComponent("\(range.index).part")
+
+        _ = try await RetryPolicy.withRetry(
+            label: "\(path)#range-\(range.index)",
+            maxAttempts: maxAttempts,
+            minBackoff: minBackoff,
+            logger: logger
+        ) { _ in
+            try? FileManager.default.removeItem(at: destination)
+            let response = try await streamDownload(
+                request: rangeRequest,
+                to: destination,
+                configuration: configuration,
+                onProgress: { bytesWritten, _ in
+                    progressState.record(range: range, bytesWritten: bytesWritten)
+                },
+                validateResponse: { response in
+                    try validateParallelRangeResponse(
+                        response,
+                        range: range,
+                        path: path,
+                        expectedSize: expectedSize,
+                        progressState: progressState
+                    )
+                }
+            )
+            try validateDownloadedArtifact(
+                at: destination,
+                response: response,
+                path: "\(path)#range-\(range.index)",
+                expectedSize: range.byteCount
+            )
+            progressState.record(range: range, bytesWritten: Int64(range.byteCount))
+            return response
+        }
+    }
+
+    private static func validateParallelRangeResponse(
+        _ response: HTTPURLResponse,
+        range: ParallelRange,
+        path: String,
+        expectedSize: Int,
+        progressState: ParallelRangeState
+    ) throws {
+        try HFClient.checkRateLimitForRetry(response, context: "downloading \(path)")
+        guard response.statusCode == 206 else {
+            if response.statusCode == 200 {
+                throw ParallelRangeError.unsupported("server ignored the Range request")
+            }
+            throw DownloadError.downloadFailed(
+                path: path,
+                underlying: NSError(domain: "HTTP", code: response.statusCode)
+            )
+        }
+
+        guard
+            let contentRange = response.value(forHTTPHeaderField: "Content-Range"),
+            contentRange == "bytes \(range.start)-\(range.end)/\(expectedSize)"
+        else {
+            throw DownloadError.invalidArtifact(
+                path: path, reason: "invalid Content-Range for parallel download")
+        }
+        guard
+            let validator = response.value(forHTTPHeaderField: "ETag"),
+            !validator.hasPrefix("W/")
+        else {
+            throw ParallelRangeError.unsupported("server did not provide a strong ETag")
+        }
+        try progressState.accept(validator: validator, path: path)
+    }
+
+    private static func makeParallelRanges(totalBytes: Int, chunkSize: Int) -> [ParallelRange] {
+        var ranges: [ParallelRange] = []
+        var start = 0
+        while start < totalBytes {
+            let end = min(start + chunkSize - 1, totalBytes - 1)
+            ranges.append(ParallelRange(index: ranges.count, start: start, end: end))
+            start = end + 1
+        }
+        return ranges
+    }
 }
 
 // MARK: - URLSession download delegate for byte-level progress
@@ -415,6 +726,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
     private let resumeOffset: Int64
     private let onProgress: (@Sendable (Int64, Int64) -> Void)?
     private let onResponse: (@Sendable (HTTPURLResponse) -> Void)?
+    private let validateResponse: (@Sendable (HTTPURLResponse) throws -> Void)?
     // Holds the non-Sendable continuation and file handle; the lock (not
     // `@unchecked`) makes the delegate Sendable as URLSession requires.
     private let state = OSAllocatedUnfairLock<State>(uncheckedState: State())
@@ -423,12 +735,14 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         destination: URL,
         resumeOffset: Int64,
         onProgress: (@Sendable (Int64, Int64) -> Void)?,
-        onResponse: (@Sendable (HTTPURLResponse) -> Void)?
+        onResponse: (@Sendable (HTTPURLResponse) -> Void)?,
+        validateResponse: (@Sendable (HTTPURLResponse) throws -> Void)?
     ) {
         self.destination = destination
         self.resumeOffset = resumeOffset
         self.onProgress = onProgress
         self.onResponse = onResponse
+        self.validateResponse = validateResponse
     }
 
     /// Register the continuation and task before the task starts.
@@ -453,6 +767,13 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
         guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            return
+        }
+        do {
+            try validateResponse?(http)
+        } catch {
+            state.withLockUnchecked { $0.writeError = error }
             completionHandler(.cancel)
             return
         }
