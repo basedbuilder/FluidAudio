@@ -27,7 +27,10 @@ let package = Package(
                 "MachTaskSelfWrapper",
                 "NemoTextProcessing",
             ],
-            path: "Sources/FluidAudio"
+            path: "Sources/FluidAudio",
+            resources: [
+                .copy("TTS/LuxTts/G2p/Resources")
+            ]
         ),
         // Byte-exact NeMo text normalization (FST engine, all 7 languages).
         // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.0.
@@ -61,6 +64,9 @@ let package = Package(
             dependencies: [
                 "FluidAudio",
                 "FluidAudioCLI",
+            ],
+            resources: [
+                .copy("TTS/LuxTts/Resources")
             ]
         ),
     ],
