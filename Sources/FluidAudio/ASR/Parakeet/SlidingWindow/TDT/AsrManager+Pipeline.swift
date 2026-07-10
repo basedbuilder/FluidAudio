@@ -15,6 +15,70 @@ extension AsrManager {
         emitTokensAfterGlobalFrame: Int? = nil,
         initialTimeIndexOverride: Int? = nil
     ) async throws -> (hypothesis: TdtHypothesis, encoderSequenceLength: Int) {
+        let result = try await executeMLInference(
+            paddedAudio,
+            originalLength: originalLength,
+            actualAudioFrames: actualAudioFrames,
+            decoderState: &decoderState,
+            contextFrameAdjustment: contextFrameAdjustment,
+            isLastChunk: isLastChunk,
+            globalFrameOffset: globalFrameOffset,
+            language: language,
+            emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+            initialTimeIndexOverride: initialTimeIndexOverride,
+            includeEncoderOutput: false
+        )
+        return (result.hypothesis, result.encoderSequenceLength)
+    }
+
+    internal func executeMLInferenceWithLocalEncoderOutput(
+        _ paddedAudio: [Float],
+        originalLength: Int? = nil,
+        actualAudioFrames: Int? = nil,
+        decoderState: inout TdtDecoderState,
+        contextFrameAdjustment: Int = 0,
+        isLastChunk: Bool = false,
+        globalFrameOffset: Int = 0,
+        language: Language? = nil,
+        emitTokensAfterGlobalFrame: Int? = nil,
+        initialTimeIndexOverride: Int? = nil
+    ) async throws -> (
+        hypothesis: TdtHypothesis,
+        encoderSequenceLength: Int,
+        encoderOutput: MLMultiArray?
+    ) {
+        try await executeMLInference(
+            paddedAudio,
+            originalLength: originalLength,
+            actualAudioFrames: actualAudioFrames,
+            decoderState: &decoderState,
+            contextFrameAdjustment: contextFrameAdjustment,
+            isLastChunk: isLastChunk,
+            globalFrameOffset: globalFrameOffset,
+            language: language,
+            emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
+            initialTimeIndexOverride: initialTimeIndexOverride,
+            includeEncoderOutput: true
+        )
+    }
+
+    private func executeMLInference(
+        _ paddedAudio: [Float],
+        originalLength: Int?,
+        actualAudioFrames: Int?,
+        decoderState: inout TdtDecoderState,
+        contextFrameAdjustment: Int,
+        isLastChunk: Bool,
+        globalFrameOffset: Int,
+        language: Language?,
+        emitTokensAfterGlobalFrame: Int?,
+        initialTimeIndexOverride: Int?,
+        includeEncoderOutput: Bool
+    ) async throws -> (
+        hypothesis: TdtHypothesis,
+        encoderSequenceLength: Int,
+        encoderOutput: MLMultiArray?
+    ) {
 
         let preprocessorInput = try await preparePreprocessorInput(
             paddedAudio, actualLength: originalLength)
@@ -81,13 +145,105 @@ extension AsrManager {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)
             }
 
-            return (hypothesis, encoderSequenceLength)
+            return (
+                hypothesis,
+                encoderSequenceLength,
+                includeEncoderOutput ? rawEncoderOutput : nil
+            )
         } catch {
             if let preprocessorAudioArray {
                 await sharedMLArrayCache.returnArray(preprocessorAudioArray)
             }
             throw error
         }
+    }
+
+    internal func computeCtcHeadLogProbs(
+        encoderOutput: MLMultiArray,
+        audioSampleCount: Int
+    ) async throws -> (logProbs: [[Float]], frameDuration: Double) {
+        guard let models = asrModels else {
+            throw ASRError.notInitialized
+        }
+        guard models.version == .tdtCtc110m else {
+            throw ASRError.processingFailed("CTC-head rescoring requires TDT-CTC-110M")
+        }
+        guard let ctcHead = models.ctcHead else {
+            throw ASRError.processingFailed("CTC-head model unavailable for TDT-CTC-110M")
+        }
+
+        let input = try MLDictionaryFeatureProvider(dictionary: [
+            "encoder_output": MLFeatureValue(multiArray: encoderOutput)
+        ])
+        let output = try await ctcHead.compatPrediction(
+            from: input,
+            options: predictionOptions
+        )
+        guard let logits = output.featureValue(for: "ctc_logits")?.multiArrayValue else {
+            let available = output.featureNames.sorted().joined(separator: ", ")
+            throw ASRError.processingFailed(
+                "Missing ctc_logits from CTC head output. Available outputs: \(available)"
+            )
+        }
+
+        let allLogProbs = try ctcHeadLogProbs(from: logits, blankId: models.version.blankId)
+        guard !allLogProbs.isEmpty else { return ([], 0) }
+
+        let sampleCount = min(max(audioSampleCount, 0), ASRConstants.maxModelSamples)
+        let samplesPerFrame = Double(ASRConstants.maxModelSamples) / Double(allLogProbs.count)
+        let validFrames = Int(ceil(Double(sampleCount) / samplesPerFrame))
+        let frameCount = max(1, min(validFrames, allLogProbs.count))
+        let trimmed = Array(allLogProbs.prefix(frameCount))
+        let frameDuration =
+            Double(sampleCount) / Double(frameCount) / Double(ASRConstants.sampleRate)
+        return (trimmed, frameDuration)
+    }
+
+    private func ctcHeadLogProbs(
+        from output: MLMultiArray,
+        blankId: Int
+    ) throws -> [[Float]] {
+        let rank = output.shape.count
+        guard rank == 3 || rank == 4 else {
+            throw ASRError.processingFailed("Unexpected CTC output rank: \(output.shape)")
+        }
+
+        let timeSteps: Int
+        let vocabularySize: Int
+        let index: (Int, Int) -> [NSNumber]
+        if rank == 3 {
+            timeSteps = output.shape[1].intValue
+            vocabularySize = output.shape[2].intValue
+            index = { time, token in [0, time, token].map { NSNumber(value: $0) } }
+        } else {
+            vocabularySize = output.shape[1].intValue
+            timeSteps = output.shape[3].intValue
+            index = { time, token in [0, token, 0, time].map { NSNumber(value: $0) } }
+        }
+        guard timeSteps > 0, vocabularySize > 0 else { return [] }
+
+        let temperature = ContextBiasingConstants.ctcTemperature
+        let blankBias = ContextBiasingConstants.blankBias
+        var result = [[Float]]()
+        result.reserveCapacity(timeSteps)
+
+        for time in 0..<timeSteps {
+            var logits = [Float]()
+            logits.reserveCapacity(vocabularySize)
+            for token in 0..<vocabularySize {
+                logits.append(output[index(time, token)].floatValue / temperature)
+            }
+
+            let maximum = logits.max() ?? 0
+            let logSum = logf(logits.reduce(0) { $0 + expf($1 - maximum) })
+            var row = logits.map { ($0 - maximum) - logSum }
+            if blankBias != 0, row.indices.contains(blankId) {
+                row[blankId] -= blankBias
+            }
+            result.append(row)
+        }
+
+        return result
     }
 
     private func prepareEncoderInput(

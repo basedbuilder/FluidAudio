@@ -229,4 +229,71 @@ final class VocabularyRescorerUtilsTests: XCTestCase {
             )
         }
     }
+
+    // MARK: - CTC Candidate Preflight
+
+    func testCtcCandidatePreflightFindsSimilarSingleWord() {
+        let vocabulary = CustomVocabularyContext(terms: [
+            CustomVocabularyTerm(text: "Supabase", ctcTokenIds: [1, 2, 3])
+        ])
+
+        XCTAssertTrue(
+            VocabularyRescorer.hasPotentialCtcTokenRescoreCandidate(
+                vocabulary: vocabulary,
+                transcript: "Testing Superbase today",
+                tokenTimings: timings("Testing", "Superbase", "today"),
+                minSimilarity: 0.55
+            )
+        )
+    }
+
+    func testCtcCandidatePreflightFindsSplitCompound() {
+        let vocabulary = CustomVocabularyContext(terms: [
+            CustomVocabularyTerm(text: "Supabase", ctcTokenIds: [1, 2, 3])
+        ])
+
+        XCTAssertTrue(
+            VocabularyRescorer.hasPotentialCtcTokenRescoreCandidate(
+                vocabulary: vocabulary,
+                transcript: "Testing super base today",
+                tokenTimings: timings("Testing", "super", "base", "today"),
+                minSimilarity: 0.55
+            )
+        )
+    }
+
+    func testCtcCandidatePreflightSkipsExactAndUnrelatedWords() {
+        let vocabulary = CustomVocabularyContext(terms: [
+            CustomVocabularyTerm(text: "Apify", ctcTokenIds: [1, 2])
+        ])
+
+        XCTAssertFalse(
+            VocabularyRescorer.hasPotentialCtcTokenRescoreCandidate(
+                vocabulary: vocabulary,
+                transcript: "Apify works",
+                tokenTimings: timings("Apify", "works"),
+                minSimilarity: 0.55
+            )
+        )
+        XCTAssertFalse(
+            VocabularyRescorer.hasPotentialCtcTokenRescoreCandidate(
+                vocabulary: vocabulary,
+                transcript: "A completely unrelated sentence",
+                tokenTimings: timings("A", "completely", "unrelated", "sentence"),
+                minSimilarity: 0.55
+            )
+        )
+    }
+
+    private func timings(_ words: String...) -> [TokenTiming] {
+        words.enumerated().map { index, word in
+            TokenTiming(
+                token: "▁\(word)",
+                tokenId: index,
+                startTime: Double(index) * 0.2,
+                endTime: Double(index + 1) * 0.2,
+                confidence: 1
+            )
+        }
+    }
 }

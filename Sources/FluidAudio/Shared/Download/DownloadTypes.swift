@@ -74,9 +74,22 @@ public struct DownloadProgress: Sendable {
     /// Current phase of the operation.
     public let phase: DownloadPhase
 
-    public init(fractionCompleted: Double, phase: DownloadPhase) {
+    /// Bytes downloaded from files whose remote size is known.
+    public let downloadedBytes: Int64?
+
+    /// Total bytes for files whose remote size is known.
+    public let totalBytes: Int64?
+
+    public init(
+        fractionCompleted: Double,
+        phase: DownloadPhase,
+        downloadedBytes: Int64? = nil,
+        totalBytes: Int64? = nil
+    ) {
         self.fractionCompleted = fractionCompleted
         self.phase = phase
+        self.downloadedBytes = downloadedBytes
+        self.totalBytes = totalBytes
     }
 }
 

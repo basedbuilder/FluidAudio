@@ -50,7 +50,7 @@ extension VocabularyRescorer {
         var vocabTokensUsed = candidate.vocabTokens
         var vocabCtcScore: Float = -.infinity
         do {
-            let (score, _, _) = spotter.ctcWordSpotConstrained(
+            let (score, _, _) = CtcDPAlgorithm.ctcWordSpotConstrained(
                 logProbs: logProbs,
                 keywordTokens: candidate.vocabTokens,
                 searchStartFrame: searchStart,
@@ -61,7 +61,7 @@ extension VocabularyRescorer {
         if let tokenizer = ctcTokenizer {
             let altTokens = tokenizer.encodeWithoutBoundary(candidate.vocabTerm)
             if !altTokens.isEmpty && altTokens != candidate.vocabTokens {
-                let (altScore, _, _) = spotter.ctcWordSpotConstrained(
+                let (altScore, _, _) = CtcDPAlgorithm.ctcWordSpotConstrained(
                     logProbs: logProbs,
                     keywordTokens: altTokens,
                     searchStartFrame: searchStart,
@@ -98,7 +98,7 @@ extension VocabularyRescorer {
             )
         }
 
-        let (originalCtcScore, _, _) = spotter.ctcWordSpotConstrained(
+        let (originalCtcScore, _, _) = CtcDPAlgorithm.ctcWordSpotConstrained(
             logProbs: logProbs,
             keywordTokens: originalTokens,
             searchStartFrame: searchStart,

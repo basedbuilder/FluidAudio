@@ -179,6 +179,113 @@ extension VocabularyRescorer {
 
     // MARK: - Public API
 
+    /// Return whether the transcript has a plausible vocabulary span worth CTC scoring.
+    public func hasPotentialCtcTokenRescoreCandidate(
+        transcript: String,
+        tokenTimings: [TokenTiming],
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+    ) -> Bool {
+        Self.hasPotentialCtcTokenRescoreCandidate(
+            vocabulary: vocabulary,
+            transcript: transcript,
+            tokenTimings: tokenTimings,
+            minSimilarity: minSimilarity
+        )
+    }
+
+    /// Pure candidate preflight for callers that must avoid unnecessary CTC inference.
+    static func hasPotentialCtcTokenRescoreCandidate(
+        vocabulary: CustomVocabularyContext,
+        transcript: String,
+        tokenTimings: [TokenTiming],
+        minSimilarity: Float = ContextBiasingConstants.minSimilarityFloor
+    ) -> Bool {
+        guard !transcript.isEmpty else { return false }
+        let words = preflightWords(from: tokenTimings)
+        guard !words.isEmpty else { return false }
+
+        for term in vocabulary.terms {
+            guard term.text.count >= vocabulary.minTermLength else { continue }
+            guard !(term.ctcTokenIds ?? term.tokenIds ?? []).isEmpty else { continue }
+
+            let forms = preflightForms(for: term)
+            guard !forms.isEmpty else { continue }
+            let canonical = Self.normalizeForSimilarity(term.text)
+            let termMinSimilarity = term.minSimilarity ?? minSimilarity
+            let maximumSpan = min(4, words.count)
+
+            for spanLength in 1...maximumSpan {
+                let threshold = spanLength > 1 ? max(termMinSimilarity, 0.55) : termMinSimilarity
+                for start in 0...(words.count - spanLength) {
+                    let spanWords = Array(words[start..<(start + spanLength)])
+                    let normalizedPhrase = Self.normalizeForSimilarity(
+                        spanWords.joined(separator: spanLength == 1 ? "" : " ")
+                    )
+                    guard !normalizedPhrase.isEmpty, normalizedPhrase != canonical else { continue }
+                    if spanLength == 1, Self.stopwords.contains(normalizedPhrase) { continue }
+
+                    let adjustedThreshold: Float
+                    if spanLength > 1,
+                        spanWords.contains(where: {
+                            Self.multiWordStopwords.contains(Self.normalizeForSimilarity($0))
+                        })
+                    {
+                        adjustedThreshold = max(
+                            threshold,
+                            ContextBiasingConstants.stopwordSpanSimilarity
+                        )
+                    } else {
+                        adjustedThreshold = threshold
+                    }
+
+                    if forms.contains(where: {
+                        Self.stringSimilarity(normalizedPhrase, $0) >= adjustedThreshold
+                    }) {
+                        return true
+                    }
+
+                    if spanLength > 1 {
+                        let concatenated = Self.normalizeForSimilarity(spanWords.joined())
+                        if forms.contains(where: {
+                            Self.stringSimilarity(concatenated, $0.replacingOccurrences(of: " ", with: ""))
+                                >= adjustedThreshold
+                        }) {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+
+        return false
+    }
+
+    private static func preflightForms(for term: CustomVocabularyTerm) -> [String] {
+        var forms = [term.text]
+        forms.append(contentsOf: term.aliases ?? [])
+        return Array(Set(forms.map(Self.normalizeForSimilarity).filter { !$0.isEmpty }))
+    }
+
+    private static func preflightWords(from tokenTimings: [TokenTiming]) -> [String] {
+        var words: [String] = []
+        var currentWord = ""
+
+        for timing in tokenTimings {
+            let token = timing.token
+            guard !token.isEmpty, token != "<blank>", token != "<pad>" else { continue }
+            let startsNewWord = token.hasPrefix(" ") || token.hasPrefix("▁") || currentWord.isEmpty
+            if startsNewWord, !currentWord.isEmpty {
+                words.append(currentWord)
+            }
+            let stripped = token.trimmingCharacters(in: CharacterSet(charactersIn: " ▁"))
+            currentWord = startsNewWord ? stripped : currentWord + stripped
+        }
+        if !currentWord.isEmpty {
+            words.append(currentWord)
+        }
+        return words
+    }
+
     /// Rescore using constrained CTC token scoring around TDT word locations.
     ///
     /// Dispatches to either word-centric (BK-tree enabled) or term-centric (default) algorithm.
@@ -843,6 +950,7 @@ extension VocabularyRescorer {
         vocabularyNormalizedSet: Set<String>,
         pendingReplacements: inout [PendingReplacement]
     ) {
+        guard let spotter else { return }
         let result = spotter.spotKeywordsFromLogProbs(
             logProbs: logProbs,
             frameDuration: frameDuration,

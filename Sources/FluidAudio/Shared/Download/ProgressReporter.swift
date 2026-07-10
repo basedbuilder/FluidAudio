@@ -12,8 +12,20 @@ struct ProgressReporter: Sendable {
     /// Fraction of the overall operation the download phase occupies.
     let downloadPhaseWeight: Double
 
-    private func emit(_ fraction: Double, _ phase: DownloadPhase) {
-        handler?(DownloadProgress(fractionCompleted: fraction, phase: phase))
+    private func emit(
+        _ fraction: Double,
+        _ phase: DownloadPhase,
+        completedBytes: Int64? = nil,
+        totalBytes: Int64? = nil
+    ) {
+        handler?(
+            DownloadProgress(
+                fractionCompleted: fraction,
+                phase: phase,
+                downloadedBytes: completedBytes,
+                totalBytes: totalBytes
+            )
+        )
     }
 
     /// Byte-weighted fraction of the download phase: bytes when total bytes
@@ -48,7 +60,12 @@ struct ProgressReporter: Sendable {
             * Self.downloadFraction(
                 completedBytes: completedBytes, totalBytes: totalBytes,
                 completedFiles: fileIndex, totalFiles: totalFiles)
-        emit(fraction, .downloading(completedFiles: fileIndex, totalFiles: totalFiles))
+        emit(
+            fraction,
+            .downloading(completedFiles: fileIndex, totalFiles: totalFiles),
+            completedBytes: completedBytes,
+            totalBytes: totalBytes
+        )
     }
 
     /// Factory for the per-file live-bytes callback both download loops hand
@@ -76,7 +93,12 @@ struct ProgressReporter: Sendable {
             * Self.downloadFraction(
                 completedBytes: completedBytes, totalBytes: totalBytes,
                 completedFiles: completedFiles, totalFiles: totalFiles)
-        emit(fraction, .downloading(completedFiles: completedFiles, totalFiles: totalFiles))
+        emit(
+            fraction,
+            .downloading(completedFiles: completedFiles, totalFiles: totalFiles),
+            completedBytes: totalBytes > 0 ? completedBytes : nil,
+            totalBytes: totalBytes > 0 ? totalBytes : nil
+        )
     }
 
     /// The cached fast path: download phase complete without network.

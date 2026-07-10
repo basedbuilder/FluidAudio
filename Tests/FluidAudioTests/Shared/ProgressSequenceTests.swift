@@ -73,6 +73,8 @@ final class ProgressSequenceTests: XCTestCase {
         }
         XCTAssertEqual(completed, total)
         XCTAssertEqual(events.last!.fractionCompleted, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(events.last!.downloadedBytes, 80)
+        XCTAssertEqual(events.last!.totalBytes, 80)
     }
 
     func testFileCountersNeverExceedTotalsAndReachTotal() async throws {

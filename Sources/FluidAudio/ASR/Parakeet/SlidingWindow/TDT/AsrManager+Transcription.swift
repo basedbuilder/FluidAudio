@@ -2,6 +2,102 @@ import Foundation
 
 extension AsrManager {
 
+    /// Transcribe one model window and rescore plausible vocabulary spans with the fused CTC head.
+    public func transcribe(
+        _ audioSamples: [Float],
+        decoderState: inout TdtDecoderState,
+        language: Language? = nil,
+        customVocabulary: CustomVocabularyContext,
+        vocabularyRescorer: VocabularyRescorer
+    ) async throws -> ASRResult {
+        guard isAvailable else { throw ASRError.notInitialized }
+        let minimumRequiredSamples = ASRConstants.minimumRequiredSamples(forSampleRate: config.sampleRate)
+        guard audioSamples.count >= minimumRequiredSamples else { throw ASRError.invalidAudioData }
+        guard audioSamples.count <= ASRConstants.maxModelSamples else {
+            throw ASRError.processingFailed(
+                "CTC-head custom vocabulary rescoring is only available for single-window audio"
+            )
+        }
+
+        let startTime = Date()
+        let (alignedSamples, frameAlignedLength) = frameAlignedAudio(audioSamples)
+        let paddedAudio = padAudioIfNeeded(
+            alignedSamples,
+            targetLength: ASRConstants.maxModelSamples
+        )
+        let (hypothesis, encoderSequenceLength, encoderOutput) =
+            try await executeMLInferenceWithLocalEncoderOutput(
+                paddedAudio,
+                originalLength: frameAlignedLength,
+                actualAudioFrames: nil,
+                decoderState: &decoderState,
+                isLastChunk: true,
+                language: language
+            )
+
+        let result = processTranscriptionResult(
+            tokenIds: hypothesis.ySequence,
+            timestamps: hypothesis.timestamps,
+            confidences: hypothesis.tokenConfidences,
+            tokenDurations: hypothesis.tokenDurations,
+            encoderSequenceLength: encoderSequenceLength,
+            audioSamples: audioSamples,
+            processingTime: Date().timeIntervalSince(startTime)
+        )
+        guard let tokenTimings = result.tokenTimings, !tokenTimings.isEmpty else {
+            return result
+        }
+
+        let rescorerConfig = ContextBiasingConstants.rescorerConfig(
+            forVocabSize: customVocabulary.terms.count
+        )
+        let minSimilarity = max(rescorerConfig.minSimilarity, customVocabulary.minSimilarity)
+        guard vocabularyRescorer.hasPotentialCtcTokenRescoreCandidate(
+            transcript: result.text,
+            tokenTimings: tokenTimings,
+            minSimilarity: minSimilarity
+        ) else {
+            return result
+        }
+        guard let encoderOutput else {
+            throw ASRError.processingFailed(
+                "CTC-head custom vocabulary requested but no encoder output was produced"
+            )
+        }
+
+        let ctc = try await computeCtcHeadLogProbs(
+            encoderOutput: encoderOutput,
+            audioSampleCount: frameAlignedLength
+        )
+        guard !ctc.logProbs.isEmpty else {
+            throw ASRError.processingFailed(
+                "CTC-head custom vocabulary requested but no CTC log-probabilities were produced"
+            )
+        }
+
+        let rescored = vocabularyRescorer.ctcTokenRescore(
+            transcript: result.text,
+            tokenTimings: tokenTimings,
+            logProbs: ctc.logProbs,
+            frameDuration: ctc.frameDuration,
+            cbw: rescorerConfig.cbw,
+            marginSeconds: ContextBiasingConstants.defaultMarginSeconds,
+            minSimilarity: minSimilarity
+        )
+        let detected = uniquePreservingOrder(
+            rescored.replacements.compactMap(\.replacementWord)
+        )
+        let applied = uniquePreservingOrder(
+            rescored.replacements.filter(\.shouldReplace).compactMap(\.replacementWord)
+        )
+
+        return result.withRescoring(
+            text: rescored.text,
+            detected: detected.isEmpty ? nil : detected,
+            applied: applied.isEmpty ? nil : applied
+        )
+    }
+
     internal func transcribeWithState(
         _ audioSamples: [Float], decoderState: inout TdtDecoderState, language: Language? = nil
     ) async throws -> ASRResult {
@@ -119,6 +215,11 @@ extension AsrManager {
             processingTime: processingTime,
             tokenTimings: resultTimings
         )
+    }
+
+    private func uniquePreservingOrder(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
     }
 
 }
