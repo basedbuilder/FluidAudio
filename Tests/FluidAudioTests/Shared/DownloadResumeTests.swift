@@ -242,6 +242,37 @@ final class DownloadResumeTests: XCTestCase {
         XCTAssertEqual(events.last?.written, Int64(Self.fullBody.count))
         XCTAssertEqual(events.last?.expected, Int64(Self.fullBody.count))
     }
+
+    func testProgressReportsDurableWritesAtBufferBoundary() async throws {
+        let boundary = 1 * 1024 * 1024
+        let body = Data(repeating: 0x42, count: boundary + 17)
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"v1\""],
+                chunks: [Data(body.prefix(boundary)), Data(body.suffix(17))],
+                delayBetweenChunks: 0.05))
+
+        let recorded = ProgressRecorder()
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "buffered-model.bin",
+            expectedSize: body.count,
+            partialFileURL: partialURL("buffered-model.bin"),
+            onProgress: { written, expected in recorded.append((written, expected)) },
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            configuration: stubConfiguration
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        let events = recorded.snapshot()
+        XCTAssertTrue(
+            events.contains { $0.written == boundary },
+            "the full write buffer should be durable before EOF")
+        XCTAssertEqual(events.last?.written, Int64(body.count))
+        XCTAssertEqual(events.last?.expected, Int64(body.count))
+    }
 }
 
 // MARK: - Scripted URLProtocol stub
@@ -256,6 +287,8 @@ final class ResumeStubURLProtocol: URLProtocol {
         let chunks: [Data]
         /// Deliver this many chunks, then fail with `.networkConnectionLost`.
         var failAfterChunks: Int? = nil
+        /// Keeps scripted chunks distinct when a test observes streaming behavior.
+        var delayBetweenChunks: TimeInterval = 0
         /// When set, respond like a real range-capable server instead of using
         /// `status`/`chunks`: 206 + the slice from the request's `Range` offset
         /// when the header is present, else 200 + the full body. Lets tests
@@ -329,6 +362,9 @@ final class ResumeStubURLProtocol: URLProtocol {
                 return
             }
             client?.urlProtocol(self, didLoad: chunk)
+            if script.delayBetweenChunks > 0, index < script.chunks.count - 1 {
+                Thread.sleep(forTimeInterval: script.delayBetweenChunks)
+            }
         }
         if let failAfter = script.failAfterChunks, failAfter >= script.chunks.count {
             failAfterFlush()

@@ -398,10 +398,13 @@ enum FileDownloader {
 /// survives connection drops (#757). Appends after `resumeOffset` on HTTP 206;
 /// truncates and writes from 0 on any other 2xx; discards the body otherwise.
 private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate, Sendable {
+    private static let writeBufferSize = 1 * 1024 * 1024
+
     private struct State {
         var continuation: CheckedContinuation<HTTPURLResponse, Error>?
         var task: URLSessionDataTask?
         var handle: FileHandle?
+        var pendingData = Data()
         var bytesWritten: Int64 = 0
         var expectedTotal: Int64 = -1
         var writeError: Error?
@@ -485,6 +488,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
                 }
                 state.withLockUnchecked {
                     $0.handle = handle
+                    $0.pendingData.removeAll(keepingCapacity: true)
                     $0.bytesWritten = base
                     $0.expectedTotal = expectedTotal
                 }
@@ -501,8 +505,11 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         let progress: (written: Int64, expected: Int64)? = state.withLockUnchecked { st in
             guard let handle = st.handle, st.writeError == nil else { return nil }
             do {
-                try handle.write(contentsOf: data)
-                st.bytesWritten += Int64(data.count)
+                st.pendingData.append(data)
+                guard st.pendingData.count >= Self.writeBufferSize else { return nil }
+                try handle.write(contentsOf: st.pendingData)
+                st.bytesWritten += Int64(st.pendingData.count)
+                st.pendingData.removeAll(keepingCapacity: true)
                 return (st.bytesWritten, st.expectedTotal)
             } catch {
                 st.writeError = error
@@ -523,15 +530,27 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
     ) {
         let response = task.response as? HTTPURLResponse
         // Extract the resume action under the lock, run it after releasing.
-        let resume = state.withLockUnchecked { st -> (() -> Void)? in
+        let completion = state.withLockUnchecked {
+            st -> (progress: (written: Int64, expected: Int64)?, resume: (() -> Void)?)? in
             guard !st.finished, let continuation = st.continuation else { return nil }
             st.finished = true
             st.continuation = nil
             st.task = nil
+            var finalProgress: (written: Int64, expected: Int64)?
+            if st.writeError == nil, let handle = st.handle, !st.pendingData.isEmpty {
+                do {
+                    try handle.write(contentsOf: st.pendingData)
+                    st.bytesWritten += Int64(st.pendingData.count)
+                    st.pendingData.removeAll(keepingCapacity: true)
+                    finalProgress = (st.bytesWritten, st.expectedTotal)
+                } catch {
+                    st.writeError = error
+                }
+            }
             try? st.handle?.close()
             st.handle = nil
             let writeError = st.writeError
-            return {
+            let resume = {
                 if let writeError {
                     continuation.resume(throwing: writeError)
                 } else if let error {
@@ -542,7 +561,11 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
                     continuation.resume(throwing: DownloadError.invalidResponse)
                 }
             }
+            return (finalProgress, resume)
         }
-        resume?()
+        if let progress = completion?.progress {
+            onProgress?(progress.written, progress.expected)
+        }
+        completion?.resume?()
     }
 }
