@@ -372,7 +372,11 @@ final class DownloadResumeTests: XCTestCase {
             XCTAssertEqual(reason, "parallel range validators did not match")
         }
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+        XCTAssertEqual(try Data(contentsOf: partial), Data(body.prefix(64)))
+        XCTAssertEqual(
+            try String(
+                contentsOf: FileDownloader.resumeValidatorURL(for: partial), encoding: .utf8),
+            "\"model-v1\"")
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: partial.appendingPathExtension("ranges").path))
     }
@@ -411,6 +415,214 @@ final class DownloadResumeTests: XCTestCase {
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Range"), "bytes=10-")
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "If-Range"), "\"model-v1\"")
     }
+
+    func testParallelRangeRetryKeepsExactBoundsAndMonotonicProgress() async throws {
+        let body = Data((0..<97).map { UInt8($0) })
+        ResumeStubURLProtocol.enqueue(.init(status: 503, headers: [:], chunks: []))
+        for _ in 0..<2 {
+            ResumeStubURLProtocol.enqueue(
+                .init(
+                    status: 200,
+                    headers: ["ETag": "\"model-v1\""],
+                    chunks: [],
+                    rangeAwareBody: body))
+        }
+        let recorded = ProgressRecorder()
+
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "range-retry.bin",
+            expectedSize: body.count,
+            partialFileURL: partialURL("range-retry.bin"),
+            onProgress: { written, expected in recorded.append((written, expected)) },
+            maxAttempts: 2,
+            minBackoff: 0.001,
+            configuration: stubConfiguration,
+            parallelRanges: .init(threshold: 64, chunkSize: 64, maxConcurrent: 1)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().compactMap {
+                $0.value(forHTTPHeaderField: "Range")
+            },
+            ["bytes=0-63", "bytes=0-63", "bytes=64-96"]
+        )
+        let written = recorded.snapshot().map(\.written)
+        XCTAssertEqual(written, written.sorted())
+    }
+
+    func testInvalidParallelContentRangeDoesNotFallBackToFullDownload() async throws {
+        let body = Data(repeating: 0x42, count: 97)
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 0-95/97",
+                    "ETag": "\"model-v1\"",
+                ],
+                chunks: [body]))
+
+        do {
+            _ = try await FileDownloader.download(
+                request: request,
+                path: "invalid-content-range.bin",
+                expectedSize: body.count,
+                partialFileURL: partialURL("invalid-content-range.bin"),
+                onProgress: nil,
+                maxAttempts: 1,
+                minBackoff: 0.01,
+                configuration: stubConfiguration,
+                parallelRanges: .init(threshold: 64, chunkSize: 128, maxConcurrent: 1)
+            )
+            XCTFail("expected invalid Content-Range to fail")
+        } catch DownloadError.invalidArtifact(_, let reason) {
+            XCTAssertEqual(reason, "invalid Content-Range for parallel download")
+        }
+
+        let requests = ResumeStubURLProtocol.recordedRequests()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Range"), "bytes=0-96")
+    }
+
+    func testMissingStrongETagFallsBackToSingleStream() async throws {
+        let body = Data(repeating: 0x42, count: 97)
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: [:], chunks: [], rangeAwareBody: body))
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"model-v1\""], chunks: [body]))
+
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "missing-etag.bin",
+            expectedSize: body.count,
+            partialFileURL: partialURL("missing-etag.bin"),
+            onProgress: nil,
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            configuration: stubConfiguration,
+            parallelRanges: .init(threshold: 64, chunkSize: 128, maxConcurrent: 1)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        let requests = ResumeStubURLProtocol.recordedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Range"), "bytes=0-96")
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "Range"))
+    }
+
+    func testParallelFailurePreservesPrefixForNormalResume() async throws {
+        let body = Data((0..<97).map { UInt8($0) })
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"model-v1\""],
+                chunks: [],
+                rangeAwareBody: body))
+        ResumeStubURLProtocol.enqueue(.init(status: 500, headers: [:], chunks: []))
+        let partial = partialURL("preserved-prefix.bin")
+
+        do {
+            _ = try await FileDownloader.download(
+                request: request,
+                path: "preserved-prefix.bin",
+                expectedSize: body.count,
+                partialFileURL: partial,
+                onProgress: nil,
+                maxAttempts: 1,
+                minBackoff: 0.01,
+                configuration: stubConfiguration,
+                parallelRanges: .init(threshold: 64, chunkSize: 64, maxConcurrent: 1)
+            )
+            XCTFail("expected range failure")
+        } catch DownloadError.downloadFailed {
+            // Expected: a non-capability HTTP failure must propagate.
+        }
+
+        XCTAssertEqual(try Data(contentsOf: partial), Data(body.prefix(64)))
+        XCTAssertEqual(
+            try String(
+                contentsOf: FileDownloader.resumeValidatorURL(for: partial), encoding: .utf8),
+            "\"model-v1\"")
+        XCTAssertFalse(
+            ResumeStubURLProtocol.recordedRequests().contains {
+                $0.value(forHTTPHeaderField: "Range") == nil
+            })
+
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"model-v1\""],
+                chunks: [],
+                rangeAwareBody: body))
+        let resumedURL = try await FileDownloader.download(
+            request: request,
+            path: "preserved-prefix.bin",
+            expectedSize: body.count,
+            partialFileURL: partial,
+            onProgress: nil,
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            configuration: stubConfiguration,
+            parallelRanges: .init(threshold: 64, chunkSize: 64, maxConcurrent: 1)
+        )
+        XCTAssertEqual(try Data(contentsOf: resumedURL), body)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().last?.value(forHTTPHeaderField: "Range"),
+            "bytes=64-")
+    }
+
+    func testParentCancellationWinsAndPreservesCompletedPrefix() async throws {
+        let body = Data((0..<97).map { UInt8($0) })
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"model-v1\""],
+                chunks: [],
+                rangeAwareBody: body))
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"model-v1\""],
+                chunks: [],
+                responseDelay: 1,
+                rangeAwareBody: body))
+        let partial = partialURL("cancelled-prefix.bin")
+        let downloadRequest = request
+        let configuration = stubConfiguration
+        let expectedSize = body.count
+        let task = Task {
+            try await FileDownloader.download(
+                request: downloadRequest,
+                path: "cancelled-prefix.bin",
+                expectedSize: expectedSize,
+                partialFileURL: partial,
+                onProgress: nil,
+                maxAttempts: 1,
+                minBackoff: 0.01,
+                configuration: configuration,
+                parallelRanges: .init(threshold: 64, chunkSize: 64, maxConcurrent: 1)
+            )
+        }
+
+        for _ in 0..<100 where ResumeStubURLProtocol.recordedRequests().count < 2 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(ResumeStubURLProtocol.recordedRequests().count, 2)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch {
+            XCTAssertTrue(RetryPolicy.isCancellation(error))
+        }
+        XCTAssertEqual(try Data(contentsOf: partial), Data(body.prefix(64)))
+        XCTAssertEqual(
+            try String(
+                contentsOf: FileDownloader.resumeValidatorURL(for: partial), encoding: .utf8),
+            "\"model-v1\"")
+    }
 }
 
 // MARK: - Scripted URLProtocol stub
@@ -427,6 +639,8 @@ final class ResumeStubURLProtocol: URLProtocol {
         var failAfterChunks: Int? = nil
         /// Keeps scripted chunks distinct when a test observes streaming behavior.
         var delayBetweenChunks: TimeInterval = 0
+        /// Holds the request open so tests can observe concurrency or cancel it.
+        var responseDelay: TimeInterval = 0
         /// When set, respond like a real range-capable server instead of using
         /// `status`/`chunks`: 206 + the slice from the request's `Range` offset
         /// when the header is present, else 200 + the full body. Lets tests
@@ -472,6 +686,9 @@ final class ResumeStubURLProtocol: URLProtocol {
         guard let script = Self.dequeue(recording: request), let url = request.url else {
             client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
             return
+        }
+        if script.responseDelay > 0 {
+            Thread.sleep(forTimeInterval: script.responseDelay)
         }
 
         if let body = script.rangeAwareBody {
@@ -566,6 +783,7 @@ final class ResumeStubURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+
 }
 
 /// Lock-guarded accumulator for progress events (tests only).

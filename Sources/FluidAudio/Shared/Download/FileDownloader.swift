@@ -43,9 +43,9 @@ enum FileDownloader {
         }
     }
 
-    private struct ParallelRangeTaskOutcome: @unchecked Sendable {
+    private struct ParallelRangeTaskOutcome: Sendable {
         let index: Int
-        let error: Error?
+        let error: (any Error)?
     }
 
     private final class ParallelRangeState: Sendable {
@@ -83,6 +83,10 @@ enum FileDownloader {
                 }
                 state.validator = validator
             }
+        }
+
+        func acceptedValidator() -> String? {
+            state.withLock { $0.validator }
         }
     }
 
@@ -572,38 +576,112 @@ enum FileDownloader {
             return failures
         }
 
+        if Task.isCancelled {
+            persistParallelRangePrefix(
+                ranges: ranges,
+                rangeDirectory: rangeDirectory,
+                partialURL: partialURL,
+                validatorURL: validatorURL,
+                validator: progressState.acceptedValidator(),
+                path: path
+            )
+            try Task.checkCancellation()
+        }
+
         if !failures.isEmpty {
             let ordered = failures.sorted { $0.index < $1.index }
             let selected = ordered.first { outcome in
                 guard let error = outcome.error else { return false }
                 return !RetryPolicy.isCancellation(error)
             } ?? ordered[0]
-            throw selected.error!
+            let error = selected.error!
+            if !(error is ParallelRangeError) {
+                persistParallelRangePrefix(
+                    ranges: ranges,
+                    rangeDirectory: rangeDirectory,
+                    partialURL: partialURL,
+                    validatorURL: validatorURL,
+                    validator: progressState.acceptedValidator(),
+                    path: path
+                )
+            }
+            throw error
         }
 
-        if FileManager.default.fileExists(atPath: partialURL.path) {
-            try FileManager.default.removeItem(at: partialURL)
+        let assembledBytes = try assembleParallelRangePrefix(
+            ranges: ranges, rangeDirectory: rangeDirectory, partialURL: partialURL)
+        guard assembledBytes == Int64(expectedSize) else {
+            throw DownloadError.invalidArtifact(
+                path: path,
+                reason: "parallel assembly wrote \(assembledBytes) of \(expectedSize) bytes")
         }
-        FileManager.default.createFile(atPath: partialURL.path, contents: nil)
-        let output = try FileHandle(forWritingTo: partialURL)
-        defer { try? output.close() }
-        for range in ranges {
-            let rangeURL = rangeDirectory.appendingPathComponent("\(range.index).part")
-            let input = try FileHandle(forReadingFrom: rangeURL)
-            while true {
-                let data = try input.read(upToCount: 1 * 1024 * 1024) ?? Data()
-                guard !data.isEmpty else { break }
-                try output.write(contentsOf: data)
-            }
-            try input.close()
-        }
-        try output.synchronize()
 
         try validateDownloadedArtifact(
             at: partialURL, response: nil, path: path, expectedSize: expectedSize)
         onProgress?(Int64(expectedSize), Int64(expectedSize))
         logger.info("Finished parallel range download for \(path)")
         return partialURL
+    }
+
+    private static func persistParallelRangePrefix(
+        ranges: [ParallelRange],
+        rangeDirectory: URL,
+        partialURL: URL,
+        validatorURL: URL,
+        validator: String?,
+        path: String
+    ) {
+        guard let validator else { return }
+        do {
+            let bytes = try assembleParallelRangePrefix(
+                ranges: ranges, rangeDirectory: rangeDirectory, partialURL: partialURL)
+            guard bytes > 0 else {
+                try? FileManager.default.removeItem(at: partialURL)
+                return
+            }
+            try validator.write(to: validatorURL, atomically: true, encoding: .utf8)
+            logger.info("Preserved \(bytes) resumable bytes after parallel download stopped: \(path)")
+        } catch {
+            clearPartialDownload(partialURL)
+            logger.warning(
+                "Could not preserve parallel download progress for \(path): \(error.localizedDescription)")
+        }
+    }
+
+    @discardableResult
+    private static func assembleParallelRangePrefix(
+        ranges: [ParallelRange],
+        rangeDirectory: URL,
+        partialURL: URL
+    ) throws -> Int64 {
+        if FileManager.default.fileExists(atPath: partialURL.path) {
+            try FileManager.default.removeItem(at: partialURL)
+        }
+        FileManager.default.createFile(atPath: partialURL.path, contents: nil)
+        let output = try FileHandle(forWritingTo: partialURL)
+        defer { try? output.close() }
+
+        var assembledBytes: Int64 = 0
+        for range in ranges {
+            let rangeURL = rangeDirectory.appendingPathComponent("\(range.index).part")
+            let availableBytes = min(fileSize(at: rangeURL), Int64(range.byteCount))
+            guard availableBytes > 0 else { break }
+
+            let input = try FileHandle(forReadingFrom: rangeURL)
+            var remainingBytes = availableBytes
+            while remainingBytes > 0 {
+                let readCount = min(Int64(1 * 1024 * 1024), remainingBytes)
+                let data = try input.read(upToCount: Int(readCount)) ?? Data()
+                guard !data.isEmpty else { break }
+                try output.write(contentsOf: data)
+                assembledBytes += Int64(data.count)
+                remainingBytes -= Int64(data.count)
+            }
+            try input.close()
+            guard availableBytes == Int64(range.byteCount) else { break }
+        }
+        try output.synchronize()
+        return assembledBytes
     }
 
     private static func downloadParallelRange(
@@ -683,6 +761,9 @@ enum FileDownloader {
         }
         guard
             let validator = response.value(forHTTPHeaderField: "ETag"),
+            validator.count >= 2,
+            validator.first == "\"",
+            validator.last == "\"",
             !validator.hasPrefix("W/")
         else {
             throw ParallelRangeError.unsupported("server did not provide a strong ETag")
