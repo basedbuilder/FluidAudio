@@ -56,6 +56,7 @@ enum FileDownloader {
 
         private let expectedBytes: Int64
         private let progress: (@Sendable (Int64, Int64) -> Void)?
+        private let progressQueue = DispatchQueue(label: "FluidAudio.FileDownloader.parallel-progress")
         private let state: OSAllocatedUnfairLock<State>
 
         init(rangeCount: Int, expectedBytes: Int64, progress: (@Sendable (Int64, Int64) -> Void)?) {
@@ -71,7 +72,20 @@ enum FileDownloader {
                     state.bytesByRange[range.index],
                     min(max(bytesWritten, 0), Int64(range.byteCount))
                 )
-                progress?(state.bytesByRange.reduce(0, +), expectedBytes)
+                let totalBytesWritten = state.bytesByRange.reduce(0, +)
+                if let progress {
+                    progressQueue.async {
+                        progress(totalBytesWritten, self.expectedBytes)
+                    }
+                }
+            }
+        }
+
+        func finishProgress() async {
+            await withCheckedContinuation { continuation in
+                progressQueue.async {
+                    continuation.resume()
+                }
             }
         }
 
@@ -575,6 +589,7 @@ enum FileDownloader {
             }
             return failures
         }
+        await progressState.finishProgress()
 
         if Task.isCancelled {
             persistParallelRangePrefix(
@@ -590,10 +605,11 @@ enum FileDownloader {
 
         if !failures.isEmpty {
             let ordered = failures.sorted { $0.index < $1.index }
-            let selected = ordered.first { outcome in
-                guard let error = outcome.error else { return false }
-                return !RetryPolicy.isCancellation(error)
-            } ?? ordered[0]
+            let selected =
+                ordered.first { outcome in
+                    guard let error = outcome.error else { return false }
+                    return !RetryPolicy.isCancellation(error)
+                } ?? ordered[0]
             let error = selected.error!
             if !(error is ParallelRangeError) {
                 persistParallelRangePrefix(

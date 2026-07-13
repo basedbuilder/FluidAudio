@@ -289,17 +289,38 @@ final class DownloadResumeTests: XCTestCase {
         }
 
         let recorded = ProgressRecorder()
-        let url = try await FileDownloader.download(
-            request: request,
-            path: "large-model.bin",
-            expectedSize: body.count,
-            partialFileURL: partialURL("large-model.bin"),
-            onProgress: { written, expected in recorded.append((written, expected)) },
-            maxAttempts: 1,
-            minBackoff: 0.01,
-            configuration: stubConfiguration,
-            parallelRanges: .init(threshold: 64, chunkSize: 16, maxConcurrent: 3)
+        let blockingProgress = BlockingProgressProbe()
+        let downloadRequest = request
+        let destination = partialURL("large-model.bin")
+        let configuration = stubConfiguration
+        let downloadTask = Task {
+            try await FileDownloader.download(
+                request: downloadRequest,
+                path: "large-model.bin",
+                expectedSize: body.count,
+                partialFileURL: destination,
+                onProgress: { written, expected in
+                    recorded.append((written, expected))
+                    blockingProgress.record()
+                },
+                maxAttempts: 1,
+                minBackoff: 0.01,
+                configuration: configuration,
+                parallelRanges: .init(threshold: 64, chunkSize: 16, maxConcurrent: 3)
+            )
+        }
+
+        XCTAssertEqual(blockingProgress.waitForFirstCallback(), .success)
+        for _ in 0..<100 where ResumeStubURLProtocol.finishedRequestCount() < expectedRanges.count {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(
+            ResumeStubURLProtocol.finishedRequestCount(),
+            expectedRanges.count,
+            "a blocked progress callback must not stall range state or network completion"
         )
+        blockingProgress.releaseFirstCallback()
+        let url = try await downloadTask.value
 
         XCTAssertEqual(try Data(contentsOf: url), body)
         XCTAssertEqual(
@@ -652,12 +673,14 @@ final class ResumeStubURLProtocol: URLProtocol {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var scripts: [Script] = []
     nonisolated(unsafe) private static var requests: [URLRequest] = []
+    nonisolated(unsafe) private static var finishedRequests = 0
 
     static func reset() {
         lock.lock()
         defer { lock.unlock() }
         scripts = []
         requests = []
+        finishedRequests = 0
     }
 
     static func enqueue(_ script: Script) {
@@ -670,6 +693,18 @@ final class ResumeStubURLProtocol: URLProtocol {
         lock.lock()
         defer { lock.unlock() }
         return requests
+    }
+
+    static func finishedRequestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return finishedRequests
+    }
+
+    private static func markRequestFinished() {
+        lock.lock()
+        defer { lock.unlock() }
+        finishedRequests += 1
     }
 
     private static func dequeue(recording request: URLRequest) -> Script? {
@@ -726,6 +761,7 @@ final class ResumeStubURLProtocol: URLProtocol {
             return
         }
         client?.urlProtocolDidFinishLoading(self)
+        Self.markRequestFinished()
     }
 
     /// Deliver the scripted connection drop only after already-loaded chunks
@@ -780,6 +816,7 @@ final class ResumeStubURLProtocol: URLProtocol {
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(payload))
         client?.urlProtocolDidFinishLoading(self)
+        Self.markRequestFinished()
     }
 
     override func stopLoading() {}
@@ -796,5 +833,31 @@ private final class ProgressRecorder: Sendable {
 
     func snapshot() -> [(written: Int64, expected: Int64)] {
         values.withLock { $0 }
+    }
+}
+
+/// Holds the first progress callback while range sessions continue independently.
+private final class BlockingProgressProbe: Sendable {
+    private let firstCallbackClaimed = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private let firstCallbackEntered = DispatchSemaphore(value: 0)
+    private let releaseFirst = DispatchSemaphore(value: 0)
+
+    func record() {
+        let isFirst = firstCallbackClaimed.withLock { claimed in
+            guard !claimed else { return false }
+            claimed = true
+            return true
+        }
+        guard isFirst else { return }
+        firstCallbackEntered.signal()
+        releaseFirst.wait()
+    }
+
+    func waitForFirstCallback() -> DispatchTimeoutResult {
+        firstCallbackEntered.wait(timeout: .now() + 2)
+    }
+
+    func releaseFirstCallback() {
+        releaseFirst.signal()
     }
 }
