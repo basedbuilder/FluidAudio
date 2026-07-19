@@ -750,6 +750,39 @@ final class DownloadResumeTests: XCTestCase {
             "\"model-v1\"")
     }
 
+    func testCancellationBeforeTaskAttachmentCancelsStream() async throws {
+        let destination = partialURL("cancel-before-attach.bin")
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [Self.fullBody]))
+        let gate = CancellationInsensitiveOneShotGate()
+        let downloadRequest = request
+        let configuration = stubConfiguration
+        let streamTask = Task {
+            await gate.wait()
+            return try await FileDownloader.streamDownload(
+                request: downloadRequest,
+                to: destination,
+                configuration: configuration
+            )
+        }
+
+        streamTask.cancel()
+        await gate.open()
+
+        do {
+            _ = try await streamTask.value
+            XCTFail("expected cancellation before URL task attachment to win")
+        } catch {
+            XCTAssertTrue(RetryPolicy.isCancellation(error), "unexpected error: \(error)")
+        }
+        XCTAssertTrue(
+            ResumeStubURLProtocol.recordedRequests().isEmpty,
+            "a stream cancelled before task attachment must not start a request")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: destination.path),
+            "a stream cancelled before task attachment must not write a partial file")
+    }
+
     func testConcurrentEnsureForSameDestinationUsesOnePartialTransaction() async throws {
         let destination = workDir.appendingPathComponent("concurrent-model.bin")
         let partial = destination.appendingPathExtension("partial")
@@ -1138,5 +1171,26 @@ private final class BlockingProgressProbe: Sendable {
 
     func releaseFirstCallback() {
         releaseFirst.signal()
+    }
+}
+
+/// Holds a task without observing cancellation, so a test can enter the
+/// cancellation handler with cancellation already requested.
+private actor CancellationInsensitiveOneShotGate {
+    private var isOpen = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiter = continuation
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        waiter?.resume()
+        waiter = nil
     }
 }

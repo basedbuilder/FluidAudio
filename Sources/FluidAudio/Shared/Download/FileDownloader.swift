@@ -996,6 +996,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         var expectedTotal: Int64 = -1
         var writeError: Error?
         var finished = false
+        var cancellationRequested = false
     }
 
     private let destination: URL
@@ -1026,14 +1027,22 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         continuation: CheckedContinuation<HTTPURLResponse, Error>,
         task: URLSessionDataTask
     ) {
-        state.withLockUnchecked {
+        let shouldCancel = state.withLockUnchecked {
             $0.continuation = continuation
             $0.task = task
+            return $0.cancellationRequested
+        }
+        if shouldCancel {
+            task.cancel()
         }
     }
 
     func cancel() {
-        state.withLockUnchecked { $0.task }?.cancel()
+        let task = state.withLockUnchecked {
+            $0.cancellationRequested = true
+            return $0.task
+        }
+        task?.cancel()
     }
 
     func urlSession(
