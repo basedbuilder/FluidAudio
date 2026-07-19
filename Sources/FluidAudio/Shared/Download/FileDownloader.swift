@@ -11,6 +11,57 @@ enum FileDownloader {
     /// existing `category == "DownloadUtils"` predicates keep capturing the
     /// whole download trail; renaming it is a separate, opt-in decision.
     private static let logger = AppLogger(category: "DownloadUtils")
+    private static let destinationTransactionGate = DestinationTransactionGate()
+
+    private actor DestinationTransactionGate {
+        private struct Waiter {
+            let id: UUID
+            let continuation: CheckedContinuation<Void, Error>
+        }
+
+        private var heldDestinations: Set<String> = []
+        private var waiters: [String: [Waiter]] = [:]
+
+        func acquire(_ destination: String) async throws {
+            try Task.checkCancellation()
+            guard !heldDestinations.insert(destination).inserted else { return }
+
+            let waiterID = UUID()
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await withCheckedThrowingContinuation { continuation in
+                    waiters[destination, default: []].append(
+                        Waiter(id: waiterID, continuation: continuation))
+                }
+            } onCancel: {
+                Task {
+                    await self.cancelWaiter(waiterID, for: destination)
+                }
+            }
+        }
+
+        func release(_ destination: String) {
+            guard var destinationWaiters = waiters[destination], !destinationWaiters.isEmpty else {
+                waiters[destination] = nil
+                heldDestinations.remove(destination)
+                return
+            }
+
+            let next = destinationWaiters.removeFirst()
+            waiters[destination] = destinationWaiters.isEmpty ? nil : destinationWaiters
+            next.continuation.resume()
+        }
+
+        private func cancelWaiter(_ waiterID: UUID, for destination: String) {
+            guard var destinationWaiters = waiters[destination],
+                  let index = destinationWaiters.firstIndex(where: { $0.id == waiterID }) else {
+                return
+            }
+            let waiter = destinationWaiters.remove(at: index)
+            waiters[destination] = destinationWaiters.isEmpty ? nil : destinationWaiters
+            waiter.continuation.resume(throwing: CancellationError())
+        }
+    }
 
     struct ParallelRangeConfiguration: Sendable {
         let threshold: Int
@@ -132,6 +183,35 @@ enum FileDownloader {
         recoveringBlockedPaths: Bool,
         configuration: URLSessionConfiguration? = nil,
         onBytes: (@Sendable (Int64, Int64) -> Void)? = nil
+    ) async throws -> Outcome {
+        let resolvedDestination = destination.standardizedFileURL.resolvingSymlinksInPath()
+        let destinationKey = resolvedDestination.path
+        try await destinationTransactionGate.acquire(destinationKey)
+        do {
+            try Task.checkCancellation()
+            let outcome = try await ensureTransaction(
+                file: file,
+                from: repoRemotePath,
+                at: resolvedDestination,
+                recoveringBlockedPaths: recoveringBlockedPaths,
+                configuration: configuration,
+                onBytes: onBytes
+            )
+            await destinationTransactionGate.release(destinationKey)
+            return outcome
+        } catch {
+            await destinationTransactionGate.release(destinationKey)
+            throw error
+        }
+    }
+
+    private static func ensureTransaction(
+        file: RemoteFile,
+        from repoRemotePath: String,
+        at destination: URL,
+        recoveringBlockedPaths: Bool,
+        configuration: URLSessionConfiguration?,
+        onBytes: (@Sendable (Int64, Int64) -> Void)?
     ) async throws -> Outcome {
         if FileManager.default.fileExists(atPath: destination.path) {
             return .alreadyPresent

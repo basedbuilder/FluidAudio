@@ -723,6 +723,179 @@ final class DownloadResumeTests: XCTestCase {
                 contentsOf: FileDownloader.resumeValidatorURL(for: partial), encoding: .utf8),
             "\"model-v1\"")
     }
+
+    func testConcurrentEnsureForSameDestinationUsesOnePartialTransaction() async throws {
+        let destination = workDir.appendingPathComponent("concurrent-model.bin")
+        let partial = destination.appendingPathExtension("partial")
+        let validator = FileDownloader.resumeValidatorURL(for: partial)
+        let remoteFile = RemoteFile(path: "concurrent-model.bin", size: Self.fullBody.count)
+        let originalBaseURL = ModelRegistry.baseURL
+        ModelRegistry.baseURL = "https://stub.test"
+        defer { ModelRegistry.baseURL = originalBaseURL }
+
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [Self.fullBody]))
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [Self.fullBody]))
+
+        let blockingProgress = BlockingProgressProbe()
+        let configuration = stubConfiguration
+        let first = Task {
+            try await FileDownloader.ensure(
+                file: remoteFile,
+                from: "repo",
+                at: destination,
+                recoveringBlockedPaths: false,
+                configuration: configuration,
+                onBytes: { _, _ in blockingProgress.record() }
+            )
+        }
+
+        XCTAssertEqual(blockingProgress.waitForFirstCallback(), .success)
+        let second = Task {
+            try await FileDownloader.ensure(
+                file: remoteFile,
+                from: "repo",
+                at: destination,
+                recoveringBlockedPaths: false,
+                configuration: configuration
+            )
+        }
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().count,
+            1,
+            "a second ensure for the same destination must wait for the first transaction"
+        )
+        blockingProgress.releaseFirstCallback()
+
+        let firstOutcome = try await first.value
+        let secondOutcome = try await second.value
+        guard case .downloaded = firstOutcome else {
+            return XCTFail("the transaction owner should download the file")
+        }
+        guard case .alreadyPresent = secondOutcome else {
+            return XCTFail("the waiter should recheck and reuse the completed destination")
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), Self.fullBody)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: validator.path))
+    }
+
+    func testCancelledSameDestinationWaiterStopsWaitingWithoutCancellingOwner() async throws {
+        let destination = workDir.appendingPathComponent("cancelled-waiter.bin")
+        let remoteFile = RemoteFile(path: "cancelled-waiter.bin", size: Self.fullBody.count)
+        let originalBaseURL = ModelRegistry.baseURL
+        ModelRegistry.baseURL = "https://stub.test"
+        defer { ModelRegistry.baseURL = originalBaseURL }
+
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [Self.fullBody]))
+
+        let blockingProgress = BlockingProgressProbe()
+        let configuration = stubConfiguration
+        let owner = Task {
+            try await FileDownloader.ensure(
+                file: remoteFile,
+                from: "repo",
+                at: destination,
+                recoveringBlockedPaths: false,
+                configuration: configuration,
+                onBytes: { _, _ in blockingProgress.record() }
+            )
+        }
+        XCTAssertEqual(blockingProgress.waitForFirstCallback(), .success)
+
+        let waiter = Task {
+            do {
+                _ = try await FileDownloader.ensure(
+                    file: remoteFile,
+                    from: "repo",
+                    at: destination,
+                    recoveringBlockedPaths: false,
+                    configuration: configuration
+                )
+                return false
+            } catch {
+                return RetryPolicy.isCancellation(error)
+            }
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        waiter.cancel()
+
+        let cancellationObserved = OSAllocatedUnfairLock<Bool?>(initialState: nil)
+        let observer = Task {
+            let result = await waiter.value
+            cancellationObserved.withLock { $0 = result }
+        }
+        for _ in 0..<100 where cancellationObserved.withLock({ $0 }) == nil {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(
+            cancellationObserved.withLock { $0 },
+            true,
+            "a cancelled waiter must leave the queue before the owner finishes"
+        )
+
+        blockingProgress.releaseFirstCallback()
+        _ = try await owner.value
+        await observer.value
+        XCTAssertEqual(try Data(contentsOf: destination), Self.fullBody)
+        XCTAssertEqual(ResumeStubURLProtocol.recordedRequests().count, 1)
+    }
+
+    func testConcurrentEnsureForDifferentDestinationsDoesNotSerializeGlobally() async throws {
+        let firstDestination = workDir.appendingPathComponent("first-model.bin")
+        let secondDestination = workDir.appendingPathComponent("second-model.bin")
+        let firstRemoteFile = RemoteFile(path: "first-model.bin", size: Self.fullBody.count)
+        let secondRemoteFile = RemoteFile(path: "second-model.bin", size: Self.fullBody.count)
+        let originalBaseURL = ModelRegistry.baseURL
+        ModelRegistry.baseURL = "https://stub.test"
+        defer { ModelRegistry.baseURL = originalBaseURL }
+
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [Self.fullBody]))
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [Self.fullBody]))
+
+        let blockingProgress = BlockingProgressProbe()
+        let configuration = stubConfiguration
+        let first = Task {
+            try await FileDownloader.ensure(
+                file: firstRemoteFile,
+                from: "repo",
+                at: firstDestination,
+                recoveringBlockedPaths: false,
+                configuration: configuration,
+                onBytes: { _, _ in blockingProgress.record() }
+            )
+        }
+        XCTAssertEqual(blockingProgress.waitForFirstCallback(), .success)
+
+        let second = Task {
+            try await FileDownloader.ensure(
+                file: secondRemoteFile,
+                from: "repo",
+                at: secondDestination,
+                recoveringBlockedPaths: false,
+                configuration: configuration
+            )
+        }
+        for _ in 0..<100 where !FileManager.default.fileExists(atPath: secondDestination.path) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: secondDestination.path),
+            "a different destination must finish while the first destination remains held"
+        )
+        blockingProgress.releaseFirstCallback()
+
+        _ = try await first.value
+        _ = try await second.value
+        XCTAssertEqual(try Data(contentsOf: firstDestination), Self.fullBody)
+        XCTAssertEqual(try Data(contentsOf: secondDestination), Self.fullBody)
+    }
 }
 
 // MARK: - Scripted URLProtocol stub
