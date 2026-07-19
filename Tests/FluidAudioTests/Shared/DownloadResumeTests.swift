@@ -137,6 +137,85 @@ final class DownloadResumeTests: XCTestCase {
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "If-Range"), "\"v0\"")
     }
 
+    func testMismatchedResumeContentRangeRetriesFromByteZero() async throws {
+        let expectedBody = Data("ABCD".utf8)
+        try seedPartial(Data("AB".utf8), validator: "\"v1\"")
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 0-1/4",
+                    "ETag": "\"v1\"",
+                ],
+                chunks: [Data("AB".utf8)]))
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [expectedBody]))
+
+        let body = try await download(expectedSize: expectedBody.count, maxAttempts: 2)
+
+        XCTAssertEqual(body, expectedBody)
+        let requests = ResumeStubURLProtocol.recordedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Range"), "bytes=2-")
+        if requests.count == 2 {
+            XCTAssertNil(
+                requests[1].value(forHTTPHeaderField: "Range"),
+                "an invalid resume response must clear the partial and retry from byte zero")
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: FileDownloader.resumeValidatorURL(for: partialURL()).path))
+    }
+
+    func testMalformedResumeContentLengthRetriesFromByteZero() async throws {
+        let expectedBody = Data("ABCD".utf8)
+        try seedPartial(Data("AB".utf8), validator: "\"v1\"")
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 2-3/4",
+                    "Content-Length": "2x",
+                    "ETag": "\"v1\"",
+                ],
+                chunks: [Data("CD".utf8)],
+                addsContentLengthAutomatically: false))
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [expectedBody]))
+
+        let body = try await download(expectedSize: expectedBody.count, maxAttempts: 2)
+
+        XCTAssertEqual(body, expectedBody)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().count,
+            2,
+            "a malformed Content-Length must be rejected before appending")
+    }
+
+    func testMissingResumeContentLengthRetriesFromByteZero() async throws {
+        let expectedBody = Data("ABCD".utf8)
+        try seedPartial(Data("AB".utf8), validator: "\"v1\"")
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 2-3/4",
+                    "ETag": "\"v1\"",
+                ],
+                chunks: [Data("CD".utf8)],
+                addsContentLengthAutomatically: false))
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [expectedBody]))
+
+        let body = try await download(expectedSize: expectedBody.count, maxAttempts: 2)
+
+        XCTAssertEqual(body, expectedBody)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().count,
+            2,
+            "a missing Content-Length must be rejected before appending")
+    }
+
     func testRangeNotSatisfiableClearsPartialAndRetriesFresh() async throws {
         try seedPartial(Data("BOGUSPARTIALBYTES".utf8), validator: "\"v0\"")
         ResumeStubURLProtocol.enqueue(.init(status: 416, headers: [:], chunks: []))
@@ -656,6 +735,7 @@ final class ResumeStubURLProtocol: URLProtocol {
         let status: Int
         let headers: [String: String]
         let chunks: [Data]
+        var addsContentLengthAutomatically = true
         /// Deliver this many chunks, then fail with `.networkConnectionLost`.
         var failAfterChunks: Int? = nil
         /// Keeps scripted chunks distinct when a test observes streaming behavior.
@@ -733,7 +813,7 @@ final class ResumeStubURLProtocol: URLProtocol {
 
         var headers = script.headers
         let bodyBytes = script.chunks.reduce(0) { $0 + $1.count }
-        if headers["Content-Length"] == nil {
+        if script.addsContentLengthAutomatically && headers["Content-Length"] == nil {
             headers["Content-Length"] = String(bodyBytes)
         }
         guard

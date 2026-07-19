@@ -359,6 +359,80 @@ enum FileDownloader {
         return response.value(forHTTPHeaderField: "Last-Modified")
     }
 
+    private static func parsedContentLength(from response: HTTPURLResponse) -> Int64? {
+        guard let rawValue = response.value(forHTTPHeaderField: "Content-Length") else {
+            return nil
+        }
+
+        let values = rawValue.split(
+            separator: ",", omittingEmptySubsequences: false
+        )
+        var parsedValue: Int64?
+        for value in values {
+            let trimmed = value.trimmingCharacters(
+                in: CharacterSet(charactersIn: " \t")
+            )
+            guard
+                !trimmed.isEmpty,
+                trimmed.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                let current = Int64(trimmed),
+                parsedValue == nil || parsedValue == current
+            else {
+                return nil
+            }
+            parsedValue = current
+        }
+        return parsedValue
+    }
+
+    private static func validateResumeResponse(
+        _ response: HTTPURLResponse,
+        requestedOffset: Int64,
+        expectedSize: Int,
+        path: String
+    ) throws {
+        guard response.statusCode == 206 else { return }
+
+        let contentRange = response.value(forHTTPHeaderField: "Content-Range")
+        let components = contentRange?.split(whereSeparator: { $0.isWhitespace })
+        guard
+            let components,
+            components.count == 2,
+            components[0].lowercased() == "bytes"
+        else {
+            throw DownloadError.invalidArtifact(
+                path: path, reason: "invalid Content-Range for resumed download")
+        }
+
+        let rangeAndTotal = components[1].split(
+            separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        let bounds = rangeAndTotal.first?.split(
+            separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard
+            rangeAndTotal.count == 2,
+            let bounds,
+            bounds.count == 2,
+            let start = Int64(bounds[0]),
+            let end = Int64(bounds[1]),
+            start == requestedOffset,
+            end >= start,
+            parsedContentLength(from: response) == end - start + 1
+        else {
+            throw DownloadError.invalidArtifact(
+                path: path, reason: "invalid Content-Range for resumed download")
+        }
+
+        let total = rangeAndTotal[1] == "*" ? nil : Int64(rangeAndTotal[1])
+        guard
+            rangeAndTotal[1] == "*" || total != nil,
+            total.map({ $0 > end }) ?? true,
+            expectedSize <= 0 || total == Int64(expectedSize)
+        else {
+            throw DownloadError.invalidArtifact(
+                path: path, reason: "invalid Content-Range for resumed download")
+        }
+    }
+
     /// Download a single repo file with bounded exponential-backoff retry on
     /// transient failures (timeout/TLS/connectivity, HTTP 429/503/5xx; 4xx and
     /// non-network errors fail fast — see `RetryPolicy.isRetryable`).
@@ -456,10 +530,30 @@ enum FileDownloader {
                 clearPartialDownload(partialURL)
             }
 
+            let requestedOffset = resumeOffset
+            let validateResponse: (@Sendable (HTTPURLResponse) throws -> Void)?
+            if requestedOffset > 0 {
+                validateResponse = { response in
+                    do {
+                        try validateResumeResponse(
+                            response,
+                            requestedOffset: requestedOffset,
+                            expectedSize: expectedSize,
+                            path: path
+                        )
+                    } catch {
+                        clearPartialDownload(partialURL)
+                        throw error
+                    }
+                }
+            } else {
+                validateResponse = nil
+            }
+
             let httpResponse = try await streamDownload(
                 request: attemptRequest,
                 to: partialURL,
-                resumeOffset: resumeOffset,
+                resumeOffset: requestedOffset,
                 configuration: configuration,
                 onProgress: onProgress,
                 onResponse: { response in
@@ -473,7 +567,8 @@ enum FileDownloader {
                     } else {
                         try? FileManager.default.removeItem(at: validatorURL)
                     }
-                }
+                },
+                validateResponse: validateResponse
             )
 
             try HFClient.checkRateLimitForRetry(httpResponse, context: "downloading \(path)")
