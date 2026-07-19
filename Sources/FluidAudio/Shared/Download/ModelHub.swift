@@ -340,11 +340,14 @@ public enum ModelHub {
             }
             let destPath = repoPath.appendingPathComponent(localPath)
 
-            let onBytes = reporter.liveBytesCallback(
-                baseBytes: completedBytes,
-                totalBytes: totalBytes,
-                fileIndex: index,
-                totalFiles: filesToDownload.count)
+            let onBytes =
+                file.size > 0
+                ? reporter.liveBytesCallback(
+                    baseBytes: completedBytes,
+                    totalBytes: totalBytes,
+                    fileIndex: index,
+                    totalFiles: filesToDownload.count)
+                : nil
 
             // Repo caches keep the historical corrupt-recovery behavior:
             // a regular file blocking a path component is replaced.

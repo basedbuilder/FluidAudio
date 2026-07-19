@@ -503,10 +503,14 @@ enum FileDownloader {
         }
 
         let total = rangeAndTotal[1] == "*" ? nil : Int64(rangeAndTotal[1])
+        let knownExpectedSize = expectedSize > 0 ? Int64(expectedSize) : nil
+        let completionSize = total ?? knownExpectedSize
         guard
             rangeAndTotal[1] == "*" || total != nil,
-            total.map({ $0 > end }) ?? true,
-            expectedSize <= 0 || total == Int64(expectedSize)
+            let completionSize,
+            completionSize > 0,
+            end == completionSize - 1,
+            knownExpectedSize == nil || knownExpectedSize == completionSize
         else {
             throw DownloadError.invalidArtifact(
                 path: path, reason: "invalid Content-Range for resumed download")

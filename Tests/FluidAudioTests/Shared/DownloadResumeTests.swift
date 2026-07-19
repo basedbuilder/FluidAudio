@@ -216,6 +216,32 @@ final class DownloadResumeTests: XCTestCase {
             "a missing Content-Length must be rejected before appending")
     }
 
+    func testUnknownSizeShortResumeRetriesFromByteZero() async throws {
+        let expectedBody = Data("ABCDEFGHIJ".utf8)
+        try seedPartial(Data("AB".utf8), validator: "\"v1\"")
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Range": "bytes 2-3/10",
+                    "ETag": "\"v1\"",
+                ],
+                chunks: [Data("CD".utf8)]))
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [expectedBody]))
+
+        let body = try await download(expectedSize: -1, maxAttempts: 2)
+
+        XCTAssertEqual(body, expectedBody)
+        let requests = ResumeStubURLProtocol.recordedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.first?.value(forHTTPHeaderField: "Range"), "bytes=2-")
+        guard requests.count == 2 else { return }
+        XCTAssertNil(
+            requests[1].value(forHTTPHeaderField: "Range"),
+            "an incomplete unknown-size resume must retry from byte zero")
+    }
+
     func testRangeNotSatisfiableClearsPartialAndRetriesFresh() async throws {
         try seedPartial(Data("BOGUSPARTIALBYTES".utf8), validator: "\"v0\"")
         ResumeStubURLProtocol.enqueue(.init(status: 416, headers: [:], chunks: []))

@@ -77,6 +77,40 @@ final class ProgressSequenceTests: XCTestCase {
         XCTAssertEqual(events.last!.totalBytes, 80)
     }
 
+    func testRepoDownloadWithUnknownSizeFileRemainsMonotonic() async throws {
+        let model = ModelNames.VAD.sileroVadFile
+        TreeStubURLProtocol.trees = [
+            "": [["path": model, "type": "directory"]],
+            model: [
+                ["path": "\(model)/unknown.bin", "type": "file"],
+                ["path": "\(model)/coremldata.bin", "type": "file", "size": 40],
+            ],
+        ]
+        TreeStubURLProtocol.fileBody = Data(String(repeating: "x", count: 40).utf8)
+
+        let recorder = ProgressStreamRecorder()
+        try await ModelHub.download(
+            .vad, to: workDir,
+            progressHandler: { recorder.append($0) },
+            configuration: stubConfiguration)
+
+        let events = recorder.snapshot()
+        XCTAssertFalse(events.isEmpty)
+
+        var previousFraction = -Double.infinity
+        var previousKnownBytes: Int64 = 0
+        for event in events {
+            XCTAssertGreaterThanOrEqual(event.fractionCompleted, previousFraction)
+            previousFraction = event.fractionCompleted
+
+            guard let downloadedBytes = event.downloadedBytes else { continue }
+            XCTAssertGreaterThanOrEqual(downloadedBytes, previousKnownBytes)
+            previousKnownBytes = downloadedBytes
+            XCTAssertLessThanOrEqual(downloadedBytes, event.totalBytes ?? 0)
+        }
+        XCTAssertEqual(previousKnownBytes, 40)
+    }
+
     func testFileCountersNeverExceedTotalsAndReachTotal() async throws {
         let model = ModelNames.VAD.sileroVadFile
         TreeStubURLProtocol.trees = [
