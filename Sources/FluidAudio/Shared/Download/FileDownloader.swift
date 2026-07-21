@@ -181,6 +181,7 @@ enum FileDownloader {
         from repoRemotePath: String,
         at destination: URL,
         recoveringBlockedPaths: Bool,
+        config: DownloadConfig = .default,
         configuration: URLSessionConfiguration? = nil,
         onBytes: (@Sendable (Int64, Int64) -> Void)? = nil
     ) async throws -> Outcome {
@@ -194,6 +195,7 @@ enum FileDownloader {
                 from: repoRemotePath,
                 at: resolvedDestination,
                 recoveringBlockedPaths: recoveringBlockedPaths,
+                config: config,
                 configuration: configuration,
                 onBytes: onBytes
             )
@@ -210,6 +212,7 @@ enum FileDownloader {
         from repoRemotePath: String,
         at destination: URL,
         recoveringBlockedPaths: Bool,
+        config: DownloadConfig,
         configuration: URLSessionConfiguration?,
         onBytes: (@Sendable (Int64, Int64) -> Void)?
     ) async throws -> Outcome {
@@ -235,7 +238,7 @@ enum FileDownloader {
         let encodedPath =
             file.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? file.path
         let fileURL = try ModelRegistry.resolveModel(repoRemotePath, encodedPath)
-        let request = HFClient.authorizedRequest(url: fileURL)
+        let request = HFClient.authorizedRequest(url: fileURL, timeout: config.timeout)
 
         let tempURL = try await download(
             request: request,
@@ -243,6 +246,7 @@ enum FileDownloader {
             expectedSize: file.size,
             partialFileURL: destination.appendingPathExtension("partial"),
             onProgress: onBytes,
+            config: config,
             configuration: configuration
         )
 
@@ -378,6 +382,9 @@ enum FileDownloader {
         request: URLRequest,
         to destination: URL,
         resumeOffset: Int64 = 0,
+        path: String = "",
+        minStallBytes: Int64 = 0,
+        stallWindow: TimeInterval = 0,
         configuration: URLSessionConfiguration? = nil,
         onProgress: (@Sendable (Int64, Int64) -> Void)? = nil,
         onResponse: (@Sendable (HTTPURLResponse) -> Void)? = nil,
@@ -386,6 +393,9 @@ enum FileDownloader {
         let delegate = StreamingDownloadDelegate(
             destination: destination,
             resumeOffset: resumeOffset,
+            path: path,
+            minStallBytes: minStallBytes,
+            stallWindow: stallWindow,
             onProgress: onProgress,
             onResponse: onResponse,
             validateResponse: validateResponse
@@ -542,6 +552,7 @@ enum FileDownloader {
         onProgress: (@Sendable (Int64, Int64) -> Void)?,
         maxAttempts: Int = 4,
         minBackoff: TimeInterval = 1.0,
+        config: DownloadConfig = .default,
         configuration: URLSessionConfiguration? = nil,
         parallelRanges: ParallelRangeConfiguration = .default
     ) async throws -> URL {
@@ -566,6 +577,7 @@ enum FileDownloader {
                     onProgress: onProgress,
                     maxAttempts: maxAttempts,
                     minBackoff: minBackoff,
+                    config: config,
                     configuration: configuration,
                     rangeConfiguration: parallelRanges
                 )
@@ -638,6 +650,9 @@ enum FileDownloader {
                 request: attemptRequest,
                 to: partialURL,
                 resumeOffset: requestedOffset,
+                path: path,
+                minStallBytes: config.minStallBytes,
+                stallWindow: config.stallWindow,
                 configuration: configuration,
                 onProgress: onProgress,
                 onResponse: { response in
@@ -697,6 +712,7 @@ enum FileDownloader {
         onProgress: (@Sendable (Int64, Int64) -> Void)?,
         maxAttempts: Int,
         minBackoff: TimeInterval,
+        config: DownloadConfig,
         configuration: URLSessionConfiguration?,
         rangeConfiguration: ParallelRangeConfiguration
     ) async throws -> URL {
@@ -743,6 +759,7 @@ enum FileDownloader {
                             progressState: progressState,
                             maxAttempts: maxAttempts,
                             minBackoff: minBackoff,
+                            config: config,
                             configuration: configuration
                         )
                         return ParallelRangeTaskOutcome(index: range.index, error: nil)
@@ -888,6 +905,7 @@ enum FileDownloader {
         progressState: ParallelRangeState,
         maxAttempts: Int,
         minBackoff: TimeInterval,
+        config: DownloadConfig,
         configuration: URLSessionConfiguration?
     ) async throws {
         var rangeRequest = request
@@ -904,6 +922,9 @@ enum FileDownloader {
             let response = try await streamDownload(
                 request: rangeRequest,
                 to: destination,
+                path: "\(path)#range-\(range.index)",
+                minStallBytes: config.minStallBytes,
+                stallWindow: config.stallWindow,
                 configuration: configuration,
                 onProgress: { bytesWritten, _ in
                     progressState.record(range: range, bytesWritten: bytesWritten)
@@ -994,13 +1015,31 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         var pendingData = Data()
         var bytesWritten: Int64 = 0
         var expectedTotal: Int64 = -1
+        var expectedReceivedBytes: Int64 = -1
         var writeError: Error?
         var finished = false
+        var resolutionCommitted = false
         var cancellationRequested = false
+        // Stall watchdog: `bytesAtWindowStart` snapshots `receivedBytes` at the
+        // top of each observation window; `stalled` records that the watchdog
+        // (not the caller) cancelled the task so completion surfaces a typed,
+        // retryable `.stalled` error instead of a bare cancellation.
+        var watchdog: DispatchSourceTimer?
+        var receivedBytes: Int64 = 0
+        var bytesAtWindowStart: Int64 = 0
+        var stalled = false
     }
+
+    /// Serial queue that fires every download's stall-watchdog timer; shared so
+    /// concurrent per-file downloads don't each spin up a thread.
+    private static let watchdogQueue = DispatchQueue(label: "com.fluidaudio.download.stall-watchdog")
+    private static let logger = AppLogger(category: "DownloadUtils")
 
     private let destination: URL
     private let resumeOffset: Int64
+    private let path: String
+    private let minStallBytes: Int64
+    private let stallWindow: TimeInterval
     private let onProgress: (@Sendable (Int64, Int64) -> Void)?
     private let onResponse: (@Sendable (HTTPURLResponse) -> Void)?
     private let validateResponse: (@Sendable (HTTPURLResponse) throws -> Void)?
@@ -1011,38 +1050,96 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
     init(
         destination: URL,
         resumeOffset: Int64,
+        path: String,
+        minStallBytes: Int64,
+        stallWindow: TimeInterval,
         onProgress: (@Sendable (Int64, Int64) -> Void)?,
         onResponse: (@Sendable (HTTPURLResponse) -> Void)?,
         validateResponse: (@Sendable (HTTPURLResponse) throws -> Void)?
     ) {
         self.destination = destination
         self.resumeOffset = resumeOffset
+        self.path = path
+        self.minStallBytes = minStallBytes
+        self.stallWindow = stallWindow
         self.onProgress = onProgress
         self.onResponse = onResponse
         self.validateResponse = validateResponse
     }
 
-    /// Register the continuation and task before the task starts.
+    /// Register the continuation and task before the task starts, and arm the
+    /// stall watchdog (when enabled). The timer wakes every `stallWindow` and
+    /// cancels the task if fewer than `minStallBytes` arrived since the last
+    /// wake — catching a frozen CDN connection in seconds rather than waiting
+    /// out the request's idle `timeout`.
     func attach(
         continuation: CheckedContinuation<HTTPURLResponse, Error>,
         task: URLSessionDataTask
     ) {
-        let shouldCancel = state.withLockUnchecked {
-            $0.continuation = continuation
-            $0.task = task
-            return $0.cancellationRequested
+        let timer: DispatchSourceTimer? =
+            (minStallBytes > 0 && stallWindow > 0)
+            ? DispatchSource.makeTimerSource(queue: Self.watchdogQueue) : nil
+        if let timer {
+            timer.schedule(deadline: .now() + stallWindow, repeating: stallWindow)
+            timer.setEventHandler { [weak self] in self?.checkStall() }
+            timer.resume()
+        }
+        let shouldCancel = state.withLockUnchecked { st in
+            st.continuation = continuation
+            st.task = task
+            st.watchdog = timer
+            st.receivedBytes = resumeOffset
+            st.bytesAtWindowStart = resumeOffset
+            if st.cancellationRequested {
+                st.watchdog = nil
+            }
+            return st.cancellationRequested
         }
         if shouldCancel {
+            timer?.cancel()
             task.cancel()
         }
     }
 
     func cancel() {
-        let task = state.withLockUnchecked {
-            $0.cancellationRequested = true
-            return $0.task
+        let (task, watchdog) = state.withLockUnchecked {
+            st -> (URLSessionDataTask?, DispatchSourceTimer?) in
+            guard !st.resolutionCommitted else { return (nil, nil) }
+            st.cancellationRequested = true
+            let watchdog = st.watchdog
+            st.watchdog = nil
+            return (st.task, watchdog)
         }
+        watchdog?.cancel()
         task?.cancel()
+    }
+
+    /// One watchdog tick: cancel the task if the byte count advanced by less
+    /// than `minStallBytes` over the last window. `stalled` is set under the
+    /// lock before cancelling so `didCompleteWithError` reports `.stalled`.
+    private func checkStall() {
+        let stalledTask = state.withLockUnchecked { st -> URLSessionTask? in
+            guard
+                !st.finished,
+                !st.stalled,
+                !st.cancellationRequested,
+                st.writeError == nil,
+                st.expectedReceivedBytes < 0 || st.receivedBytes < st.expectedReceivedBytes,
+                let task = st.task
+            else {
+                return nil
+            }
+            let delta = st.receivedBytes - st.bytesAtWindowStart
+            st.bytesAtWindowStart = st.receivedBytes
+            guard delta < minStallBytes else { return nil }
+            st.stalled = true
+            return task
+        }
+        guard let stalledTask else { return }
+        Self.logger.warning(
+            "Download of \(path) stalled (<\(minStallBytes) bytes in \(Int(stallWindow))s); cancelling for retry."
+        )
+        stalledTask.cancel()
     }
 
     func urlSession(
@@ -1096,7 +1193,12 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
                     $0.handle = handle
                     $0.pendingData.removeAll(keepingCapacity: true)
                     $0.bytesWritten = base
+                    $0.receivedBytes = base
+                    $0.bytesAtWindowStart = base
                     $0.expectedTotal = expectedTotal
+                    $0.expectedReceivedBytes =
+                        http.expectedContentLength >= 0
+                        ? base + http.expectedContentLength : -1
                 }
             } catch {
                 state.withLockUnchecked { $0.writeError = error }
@@ -1111,6 +1213,7 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         let progress: (written: Int64, expected: Int64)? = state.withLockUnchecked { st in
             guard let handle = st.handle, st.writeError == nil else { return nil }
             do {
+                st.receivedBytes += Int64(data.count)
                 st.pendingData.append(data)
                 guard st.pendingData.count >= Self.writeBufferSize else { return nil }
                 try handle.write(contentsOf: st.pendingData)
@@ -1125,7 +1228,8 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         if let progress {
             onProgress?(progress.written, progress.expected)
         } else if state.withLockUnchecked({ $0.writeError }) != nil {
-            cancel()
+            let task = state.withLockUnchecked { $0.task }
+            task?.cancel()
         }
     }
 
@@ -1135,9 +1239,13 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
         didCompleteWithError error: Error?
     ) {
         let response = task.response as? HTTPURLResponse
+        let path = self.path
+        let stallWindow = self.stallWindow
         // Extract the resume action under the lock, run it after releasing.
         let completion = state.withLockUnchecked {
             st -> (progress: (written: Int64, expected: Int64)?, resume: (() -> Void)?)? in
+            st.watchdog?.cancel()
+            st.watchdog = nil
             guard !st.finished, let continuation = st.continuation else { return nil }
             st.finished = true
             st.continuation = nil
@@ -1156,9 +1264,22 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
             try? st.handle?.close()
             st.handle = nil
             let writeError = st.writeError
+            let stalled = st.stalled
             let resume = {
-                if let writeError {
+                let cancellationRequested = self.state.withLockUnchecked { st in
+                    st.resolutionCommitted = true
+                    return st.cancellationRequested
+                }
+                if cancellationRequested {
+                    continuation.resume(throwing: CancellationError())
+                } else if let writeError {
                     continuation.resume(throwing: writeError)
+                } else if stalled {
+                    // The watchdog cancelled a frozen transfer: surface a typed,
+                    // retryable error rather than the bare cancellation URLError
+                    // (which the retry layer treats as a caller abort).
+                    continuation.resume(
+                        throwing: DownloadError.stalled(path: path, window: stallWindow))
                 } else if let error {
                     continuation.resume(throwing: error)
                 } else if let response {

@@ -316,6 +316,343 @@ final class DownloadResumeTests: XCTestCase {
             "a complete, valid partial must be reused without hitting the network")
     }
 
+    // MARK: - Stall watchdog (#810)
+
+    /// A frozen mid-transfer connection is cancelled by the watchdog and the
+    /// retry resumes to completion — instead of hanging on the idle `timeout`.
+    func testStalledTransferIsCancelledAndRetried() async throws {
+        // Attempt 1: 200 + ETag, delivers a small head, then freezes. The head
+        // is far below the 1 MiB threshold so the watchdog trips on its first
+        // (sub-second) window.
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"v1\"", "Content-Length": String(Self.fullBody.count)],
+                chunks: [Data(Self.fullBody.prefix(10))],
+                stall: true))
+        // Attempt 2: a range-capable server completes the file.
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [], rangeAwareBody: Self.fullBody))
+
+        let fastWatchdog = DownloadConfig(minStallBytes: 1 << 20, stallWindow: 0.2)
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "model.bin",
+            expectedSize: Self.fullBody.count,
+            partialFileURL: partialURL(),
+            onProgress: nil,
+            maxAttempts: 3,
+            minBackoff: 0.01,
+            config: fastWatchdog,
+            configuration: stubConfiguration
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), Self.fullBody)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().count, 2,
+            "the stalled attempt must be cancelled and retried")
+    }
+
+    /// A disabled watchdog (`minStallBytes == 0`) must not cancel a healthy,
+    /// progressing download.
+    func testDisabledWatchdogDoesNotCancelHealthyDownload() async throws {
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [Self.fullBody]))
+
+        let noWatchdog = DownloadConfig(minStallBytes: 0, stallWindow: 0)
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "model.bin",
+            expectedSize: Self.fullBody.count,
+            partialFileURL: partialURL(),
+            onProgress: nil,
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            config: noWatchdog,
+            configuration: stubConfiguration
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), Self.fullBody)
+        XCTAssertEqual(ResumeStubURLProtocol.recordedRequests().count, 1)
+    }
+
+    func testStalledErrorIsClassifiedRetryable() {
+        XCTAssertTrue(RetryPolicy.isRetryable(DownloadError.stalled(path: "model.bin", window: 120)))
+        XCTAssertFalse(RetryPolicy.isCancellation(DownloadError.stalled(path: "model.bin", window: 120)))
+    }
+
+    func testBufferedNetworkProgressDoesNotTripWatchdogBeforeDurableWrite() async throws {
+        let chunkSize = 64 * 1024
+        let body = Data(repeating: 0x42, count: chunkSize * 4)
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"v1\""],
+                chunks: stride(from: 0, to: body.count, by: chunkSize).map { start in
+                    Data(body[start..<min(start + chunkSize, body.count)])
+                },
+                delayBetweenChunks: 0.12))
+
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "healthy-buffered.bin",
+            expectedSize: body.count,
+            partialFileURL: partialURL("healthy-buffered.bin"),
+            onProgress: nil,
+            maxAttempts: 1,
+            minBackoff: 0.01,
+            config: DownloadConfig(minStallBytes: 1, stallWindow: 0.2),
+            configuration: stubConfiguration
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().count,
+            1,
+            "received bytes below the write-buffer boundary must count as network progress")
+    }
+
+    func testResumedOffsetDoesNotMaskFirstWindowStall() async throws {
+        let prefix = Data(repeating: 0x41, count: 64)
+        let expectedSize = 128
+        try seedPartial(prefix, validator: "\"v1\"")
+        let partial = partialURL()
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Length": "64",
+                    "Content-Range": "bytes 64-127/128",
+                    "ETag": "\"v1\"",
+                ],
+                chunks: [],
+                stall: true))
+
+        let stalledInFirstWindow = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { [request, stubConfiguration] in
+                do {
+                    _ = try await FileDownloader.download(
+                        request: request,
+                        path: "resumed-stall.bin",
+                        expectedSize: expectedSize,
+                        partialFileURL: partial,
+                        onProgress: nil,
+                        maxAttempts: 1,
+                        minBackoff: 0.01,
+                        config: DownloadConfig(minStallBytes: 32, stallWindow: 0.5),
+                        configuration: stubConfiguration
+                    )
+                    return false
+                } catch DownloadError.stalled {
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .milliseconds(750))
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+
+        XCTAssertTrue(
+            stalledInFirstWindow,
+            "the existing 64-byte partial must be the watchdog baseline, not apparent new progress")
+    }
+
+    func testParallelRangeReceivesWatchdogConfigAndRetriesStall() async throws {
+        let body = Data((0..<128).map { UInt8($0) })
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Length": "64",
+                    "Content-Range": "bytes 0-63/128",
+                    "ETag": "\"model-v1\"",
+                ],
+                chunks: [],
+                stall: true))
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"model-v1\""],
+                chunks: [],
+                rangeAwareBody: body))
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: ["ETag": "\"model-v1\""],
+                chunks: [],
+                rangeAwareBody: body))
+
+        let url = try await FileDownloader.download(
+            request: request,
+            path: "parallel-stall.bin",
+            expectedSize: body.count,
+            partialFileURL: partialURL("parallel-stall.bin"),
+            onProgress: nil,
+            maxAttempts: 2,
+            minBackoff: 0.01,
+            config: DownloadConfig(minStallBytes: 1, stallWindow: 0.2),
+            configuration: stubConfiguration,
+            parallelRanges: .init(threshold: 64, chunkSize: 64, maxConcurrent: 1)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: url), body)
+        XCTAssertEqual(
+            ResumeStubURLProtocol.recordedRequests().compactMap {
+                $0.value(forHTTPHeaderField: "Range")
+            },
+            ["bytes=0-63", "bytes=0-63", "bytes=64-127"])
+    }
+
+    func testCallerCancellationWinsAfterWatchdogFires() async throws {
+        let bufferedChunk = Data(repeating: 0x42, count: 1 * 1024 * 1024)
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 200,
+                headers: [
+                    "Content-Length": String(bufferedChunk.count * 2),
+                    "ETag": "\"v1\"",
+                ],
+                chunks: [bufferedChunk],
+                stall: true))
+        let progressGate = BlockingProgressProbe()
+        let downloadRequest = request
+        let configuration = stubConfiguration
+        let destination = partialURL("watchdog-cancel.bin")
+        let streamTask = Task {
+            try await FileDownloader.streamDownload(
+                request: downloadRequest,
+                to: destination,
+                path: "watchdog-cancel.bin",
+                minStallBytes: Int64(bufferedChunk.count * 2),
+                stallWindow: 0.2,
+                configuration: configuration,
+                onProgress: { _, _ in progressGate.record() }
+            )
+        }
+
+        let progressStarted = await progressGate.waitForFirstCallbackAsync()
+        XCTAssertTrue(progressStarted)
+        for _ in 0..<200 where ResumeStubURLProtocol.stoppedRequestCount() == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            ResumeStubURLProtocol.stoppedRequestCount(),
+            1,
+            "the watchdog must cancel the transport before caller cancellation joins the race")
+        streamTask.cancel()
+        progressGate.releaseFirstCallback()
+
+        do {
+            _ = try await streamTask.value
+            XCTFail("expected caller cancellation")
+        } catch {
+            XCTAssertTrue(
+                RetryPolicy.isCancellation(error),
+                "caller cancellation must win over a watchdog that already marked the task stalled")
+        }
+    }
+
+    func testFullyReceivedBodyIsNotStalledWhileFinalProgressCallbackRuns() async throws {
+        let body = Data(repeating: 0x42, count: 1 * 1024 * 1024)
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [body]))
+        let progressGate = BlockingProgressProbe()
+        let downloadRequest = request
+        let configuration = stubConfiguration
+        let destination = partialURL("complete-body.bin")
+        let streamTask = Task {
+            try await FileDownloader.streamDownload(
+                request: downloadRequest,
+                to: destination,
+                path: "complete-body.bin",
+                minStallBytes: Int64(body.count * 2),
+                stallWindow: 0.2,
+                configuration: configuration,
+                onProgress: { _, _ in progressGate.record() }
+            )
+        }
+
+        let progressStarted = await progressGate.waitForFirstCallbackAsync()
+        XCTAssertTrue(progressStarted)
+        try await Task.sleep(for: .milliseconds(400))
+        progressGate.releaseFirstCallback()
+
+        _ = try await streamTask.value
+        XCTAssertEqual(try Data(contentsOf: destination), body)
+    }
+
+    func testFullyReceivedParallelRangeIsNotStalledWhileFinalProgressCallbackRuns() async throws {
+        let body = Data(repeating: 0x42, count: 64)
+        ResumeStubURLProtocol.enqueue(
+            .init(
+                status: 206,
+                headers: [
+                    "Content-Length": String(body.count),
+                    "Content-Range": "bytes 0-63/128",
+                    "ETag": "\"v1\"",
+                ],
+                chunks: [body]))
+        let progressGate = BlockingProgressProbe()
+        let downloadRequest = request
+        let configuration = stubConfiguration
+        let destination = partialURL("complete-range.bin")
+        let streamTask = Task {
+            try await FileDownloader.streamDownload(
+                request: downloadRequest,
+                to: destination,
+                path: "complete-range.bin",
+                minStallBytes: 128,
+                stallWindow: 0.2,
+                configuration: configuration,
+                onProgress: { _, _ in progressGate.record() }
+            )
+        }
+
+        let progressStarted = await progressGate.waitForFirstCallbackAsync()
+        XCTAssertTrue(progressStarted)
+        try await Task.sleep(for: .milliseconds(400))
+        progressGate.releaseFirstCallback()
+
+        _ = try await streamTask.value
+        XCTAssertEqual(try Data(contentsOf: destination), body)
+    }
+
+    func testCallerCancellationDuringFinalProgressWins() async throws {
+        let body = Data(repeating: 0x42, count: 64)
+        ResumeStubURLProtocol.enqueue(
+            .init(status: 200, headers: ["ETag": "\"v1\""], chunks: [body]))
+        let progressGate = BlockingProgressProbe()
+        let downloadRequest = request
+        let configuration = stubConfiguration
+        let destination = partialURL("final-progress-cancel.bin")
+        let streamTask = Task {
+            try await FileDownloader.streamDownload(
+                request: downloadRequest,
+                to: destination,
+                configuration: configuration,
+                onProgress: { _, _ in progressGate.record() }
+            )
+        }
+
+        let progressStarted = await progressGate.waitForFirstCallbackAsync()
+        XCTAssertTrue(progressStarted)
+        streamTask.cancel()
+        progressGate.releaseFirstCallback()
+
+        do {
+            _ = try await streamTask.value
+            XCTFail("expected cancellation during final progress delivery")
+        } catch {
+            XCTAssertTrue(RetryPolicy.isCancellation(error), "unexpected error: \(error)")
+        }
+    }
+
     func testProgressIncludesResumedOffsetSoItNeverDips() async throws {
         let splitAt = 10
         try seedPartial(Data(Self.fullBody.prefix(splitAt)), validator: "\"v1\"")
@@ -974,6 +1311,9 @@ final class ResumeStubURLProtocol: URLProtocol {
         var delayBetweenChunks: TimeInterval = 0
         /// Holds the request open so tests can observe concurrency or cancel it.
         var responseDelay: TimeInterval = 0
+        /// Deliver the chunks, then go silent forever — never finish, never
+        /// fail. Simulates a frozen CDN connection so the stall watchdog fires.
+        var stall: Bool = false
         /// When set, respond like a real range-capable server instead of using
         /// `status`/`chunks`: 206 + the slice from the request's `Range` offset
         /// when the header is present, else 200 + the full body. Lets tests
@@ -986,6 +1326,7 @@ final class ResumeStubURLProtocol: URLProtocol {
     nonisolated(unsafe) private static var scripts: [Script] = []
     nonisolated(unsafe) private static var requests: [URLRequest] = []
     nonisolated(unsafe) private static var finishedRequests = 0
+    nonisolated(unsafe) private static var stoppedRequests = 0
 
     static func reset() {
         lock.lock()
@@ -993,6 +1334,7 @@ final class ResumeStubURLProtocol: URLProtocol {
         scripts = []
         requests = []
         finishedRequests = 0
+        stoppedRequests = 0
     }
 
     static func enqueue(_ script: Script) {
@@ -1013,10 +1355,22 @@ final class ResumeStubURLProtocol: URLProtocol {
         return finishedRequests
     }
 
+    static func stoppedRequestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stoppedRequests
+    }
+
     private static func markRequestFinished() {
         lock.lock()
         defer { lock.unlock() }
         finishedRequests += 1
+    }
+
+    private static func markRequestStopped() {
+        lock.lock()
+        defer { lock.unlock() }
+        stoppedRequests += 1
     }
 
     private static func dequeue(recording request: URLRequest) -> Script? {
@@ -1068,6 +1422,9 @@ final class ResumeStubURLProtocol: URLProtocol {
                 Thread.sleep(forTimeInterval: script.delayBetweenChunks)
             }
         }
+        // Frozen connection: bytes stop flowing but the request stays open, so
+        // only the stall watchdog (not the idle timeout) can end it.
+        if script.stall { return }
         if let failAfter = script.failAfterChunks, failAfter >= script.chunks.count {
             failAfterFlush()
             return
@@ -1131,7 +1488,9 @@ final class ResumeStubURLProtocol: URLProtocol {
         Self.markRequestFinished()
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        Self.markRequestStopped()
+    }
 
 }
 
@@ -1167,6 +1526,16 @@ private final class BlockingProgressProbe: Sendable {
 
     func waitForFirstCallback() -> DispatchTimeoutResult {
         firstCallbackEntered.wait(timeout: .now() + 2)
+    }
+
+    func waitForFirstCallbackAsync() async -> Bool {
+        for _ in 0..<200 {
+            if firstCallbackClaimed.withLock({ $0 }) {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return firstCallbackClaimed.withLock { $0 }
     }
 
     func releaseFirstCallback() {

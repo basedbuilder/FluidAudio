@@ -88,6 +88,7 @@ public enum ModelHub {
         directory: URL,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
         variant: String? = nil,
+        config: DownloadConfig = .default,
         progressHandler: ProgressHandler? = nil
     ) async throws -> [String: MLModel] {
         await SystemInfo.logOnce(using: logger)
@@ -95,7 +96,7 @@ public enum ModelHub {
             return try await loadModelsOnce(
                 repo, modelNames: modelNames,
                 directory: directory, computeUnits: computeUnits, variant: variant,
-                progressHandler: progressHandler)
+                config: config, progressHandler: progressHandler)
         } catch {
             // In offline mode never delete cache + re-download. Surface
             // the original load failure so the caller can decide.
@@ -115,6 +116,20 @@ public enum ModelHub {
                 throw error
             }
 
+            // Transient network failures are not corruption either. An error
+            // reaching here has already exhausted RetryPolicy's in-flight
+            // retries, but the bytes on disk are valid and resumable
+            // (FileDownloader streams into `.partial` files with HTTP Range
+            // resume). Wiping would discard exactly the bytes that make the
+            // caller's next attempt cheap — on the flaky networks most
+            // likely to land here.
+            if RetryPolicy.isRetryable(error) {
+                logger.warning(
+                    "Load failed with transient network error; preserving model cache for resume. \(error.localizedDescription)"
+                )
+                throw error
+            }
+
             logger.warning("First load failed: \(error.localizedDescription)")
             logger.info("Deleting cache and re-downloading…")
             let repoPath = directory.appendingPathComponent(repo.folderName)
@@ -124,7 +139,7 @@ public enum ModelHub {
             return try await loadModelsOnce(
                 repo, modelNames: modelNames,
                 directory: directory, computeUnits: computeUnits, variant: variant,
-                progressHandler: progressHandler)
+                config: config, progressHandler: progressHandler)
         }
     }
     private static func loadModelsOnce(
@@ -133,6 +148,7 @@ public enum ModelHub {
         directory: URL,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
         variant: String? = nil,
+        config: DownloadConfig = .default,
         progressHandler: ProgressHandler? = nil
     ) async throws -> [String: MLModel] {
         await SystemInfo.logOnce(using: logger)
@@ -163,15 +179,16 @@ public enum ModelHub {
             try await download(
                 repo, to: directory, variant: variant,
                 additionalModelNames: extraModelNames,
+                config: config,
                 progressHandler: progressHandler)
         } else {
             logger.info("Found \(repo.folderName) locally, no download needed")
             reporter.cachedModelsAvailable()
         }
 
-        let config = MLModelConfiguration()
-        config.computeUnits = computeUnits
-        config.allowLowPrecisionAccumulationOnGPU = true
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = computeUnits
+        mlConfig.allowLowPrecisionAccumulationOnGPU = true
 
         var models: [String: MLModel] = [:]
         for (index, name) in modelNames.enumerated() {
@@ -181,7 +198,7 @@ public enum ModelHub {
             reporter.compiling(name: name, index: index, count: modelNames.count)
 
             let start = Date()
-            let model = try MLModel(contentsOf: modelPath, configuration: config)
+            let model = try MLModel(contentsOf: modelPath, configuration: mlConfig)
             let elapsed = Date().timeIntervalSince(start)
 
             models[name] = model
@@ -207,11 +224,13 @@ public enum ModelHub {
         to directory: URL,
         variant: String? = nil,
         additionalModelNames: Set<String> = [],
+        config: DownloadConfig = .default,
         progressHandler: ProgressHandler? = nil
     ) async throws {
         try await download(
             repo, to: directory, variant: variant,
             additionalModelNames: additionalModelNames,
+            config: config,
             progressHandler: progressHandler,
             configuration: nil)
     }
@@ -226,6 +245,7 @@ public enum ModelHub {
         to directory: URL,
         variant: String? = nil,
         additionalModelNames: Set<String> = [],
+        config: DownloadConfig = .default,
         progressHandler: ProgressHandler? = nil,
         configuration: URLSessionConfiguration?
     ) async throws {
@@ -356,6 +376,7 @@ public enum ModelHub {
                 from: repo.remotePath,
                 at: destPath,
                 recoveringBlockedPaths: true,
+                config: config,
                 configuration: configuration,
                 onBytes: onBytes
             )
@@ -402,6 +423,7 @@ public enum ModelHub {
         _ repo: Repo,
         subdirectory: String,
         to repoDirectory: URL,
+        config: DownloadConfig = .default,
         progressHandler: ProgressHandler? = nil,
         shouldSkip: (@Sendable (String) -> Bool)? = nil
     ) async throws {
@@ -453,6 +475,7 @@ public enum ModelHub {
                 from: repo.remotePath,
                 at: destPath,
                 recoveringBlockedPaths: false,
+                config: config,
                 onBytes: onBytes
             )
             completedBytes += Int64(max(0, file.size))
