@@ -350,6 +350,23 @@ final class TextNormalizerTests: XCTestCase {
         }
     }
 
+    func testNumericDotIsNormalizedInsteadOfMaskedAsNoun() throws {
+        let normalizer = TextNormalizer()
+        try XCTSkipIf(!normalizer.isNativeAvailable, "requires the native normalizer")
+
+        XCTAssertEqual(
+            normalizer.normalizeSentence("beta one dot four build one one one"),
+            "beta1.4build111"
+        )
+    }
+
+    func testNumericPlusIsNormalizedInsteadOfMaskedAsNoun() throws {
+        let normalizer = TextNormalizer()
+        try XCTSkipIf(!normalizer.isNativeAvailable, "requires the native normalizer")
+
+        XCTAssertEqual(normalizer.normalizeSentence("one plus two"), "1 + 2")
+    }
+
     func testStandaloneAmbiguousWordStillNormalizes() throws {
         let normalizer = TextNormalizer()
         // The mask only protects natural-language usage; a standalone spoken

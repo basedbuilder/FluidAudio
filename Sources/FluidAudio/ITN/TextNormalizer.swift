@@ -34,6 +34,9 @@ public final class TextNormalizer: Sendable {
         "period", "dash", "colon", "pipe", "slash", "dot", "plus", "hash", "percent",
     ]
 
+    /// Ambiguous words that are operators when they appear between numeric operands.
+    private static let numericInfixWords: Set<String> = ["dot", "plus"]
+
     /// Resolved C function pointers (set once during init, then immutable).
     private let nemoNormalize:
         (
@@ -413,12 +416,27 @@ public final class TextNormalizer: Sendable {
         let tagger = NLTagger(tagSchemes: [.lexicalClass])
         tagger.string = input
 
+        var wordRanges: [Range<String.Index>] = []
+        var searchStart = input.startIndex
+        for word in words {
+            guard
+                let range = input.range(
+                    of: String(word),
+                    range: searchStart..<input.endIndex
+                )
+            else {
+                return (input, [:])
+            }
+            wordRanges.append(range)
+            searchStart = range.upperBound
+        }
+
         var result: [String] = []
         var restore: [Character: String] = [:]
         // Private Use Area (U+E000…) — never appears in real ASR text and is
         // passed through untouched by the native normalizer.
         var nextSentinel: UInt32 = 0xE000
-        for word in words {
+        for (index, word) in words.enumerated() {
             let wordLower = word.lowercased()
 
             guard Self.ambiguousWords.contains(wordLower) else {
@@ -426,12 +444,7 @@ public final class TextNormalizer: Sendable {
                 continue
             }
 
-            // Find this word's range in the original string for NLTagger
-            guard let wordRange = input.range(of: word) else {
-                result.append(String(word))
-                continue
-            }
-
+            let wordRange = wordRanges[index]
             let tag = tagger.tag(at: wordRange.lowerBound, unit: .word, scheme: .lexicalClass).0
 
             // A noun/verb/adjective/adverb in a multi-word sentence is being used
@@ -440,7 +453,26 @@ public final class TextNormalizer: Sendable {
             // leave it for the normalizer to process.
             let isNaturalLanguage = tag == .noun || tag == .verb || tag == .adjective || tag == .adverb
 
-            if isNaturalLanguage && words.count > 1, let scalar = UnicodeScalar(nextSentinel) {
+            let hasNumericOperands: Bool
+            if Self.numericInfixWords.contains(wordLower), index > 0, index + 1 < words.count {
+                let previousTag = tagger.tag(
+                    at: wordRanges[index - 1].lowerBound,
+                    unit: .word,
+                    scheme: .lexicalClass
+                ).0
+                let nextTag = tagger.tag(
+                    at: wordRanges[index + 1].lowerBound,
+                    unit: .word,
+                    scheme: .lexicalClass
+                ).0
+                hasNumericOperands = previousTag == .number && nextTag == .number
+            } else {
+                hasNumericOperands = false
+            }
+
+            if isNaturalLanguage && !hasNumericOperands && words.count > 1,
+                let scalar = UnicodeScalar(nextSentinel)
+            {
                 let sentinel = Character(scalar)
                 nextSentinel += 1
                 restore[sentinel] = String(word)
