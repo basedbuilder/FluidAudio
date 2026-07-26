@@ -9,6 +9,36 @@ final class OfflineConfigTests: XCTestCase {
         XCTAssertNil(clustering.minSpeakers)
         XCTAssertNil(clustering.maxSpeakers)
         XCTAssertNil(clustering.numSpeakers)
+        XCTAssertFalse(clustering.preserveAutomaticAHCClusters)
+    }
+
+    func testEmbeddingMinimumActiveRatioDefaultsToPointTwo() {
+        XCTAssertEqual(OfflineDiarizerConfig.Embedding.community.minimumActiveRatio, 0.2)
+    }
+
+    func testEmbeddingMinimumActiveRatioAcceptsClosedRangeBoundaries() {
+        var config = OfflineDiarizerConfig.default
+
+        config.embedding.minimumActiveRatio = 0
+        XCTAssertNoThrow(try config.validate())
+
+        config.embedding.minimumActiveRatio = 1
+        XCTAssertNoThrow(try config.validate())
+    }
+
+    func testEmbeddingMinimumActiveRatioRejectsValuesOutsideClosedRange() {
+        for invalidRatio: Float in [-0.01, 1.01] {
+            var config = OfflineDiarizerConfig.default
+            config.embedding.minimumActiveRatio = invalidRatio
+
+            XCTAssertThrowsError(try config.validate()) { error in
+                guard case OfflineDiarizationError.invalidConfiguration(let message) = error else {
+                    XCTFail("Expected invalidConfiguration, got \(error)")
+                    return
+                }
+                XCTAssertTrue(message.contains("embedding.minimumActiveRatio"))
+            }
+        }
     }
 
     func testClusteringAcceptsSpeakerConstraints() {

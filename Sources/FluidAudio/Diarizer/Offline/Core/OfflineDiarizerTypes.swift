@@ -96,6 +96,8 @@ public struct OfflineDiarizerConfig: Sendable {
         public var excludeOverlap: Bool
         public var minSegmentDurationSeconds: Double
         public var skipStrategy: EmbeddingSkipStrategy
+        /// Minimum share of segmentation frames that must remain active after overlap exclusion.
+        public var minimumActiveRatio: Float
 
         public static let community = Embedding(
             batchSize: 32,
@@ -108,12 +110,14 @@ public struct OfflineDiarizerConfig: Sendable {
             batchSize: Int,
             excludeOverlap: Bool,
             minSegmentDurationSeconds: Double,
-            skipStrategy: EmbeddingSkipStrategy = .none
+            skipStrategy: EmbeddingSkipStrategy = .none,
+            minimumActiveRatio: Float = 0.2
         ) {
             self.batchSize = batchSize
             self.excludeOverlap = excludeOverlap
             self.minSegmentDurationSeconds = minSegmentDurationSeconds
             self.skipStrategy = skipStrategy
+            self.minimumActiveRatio = minimumActiveRatio
         }
     }
 
@@ -134,6 +138,9 @@ public struct OfflineDiarizerConfig: Sendable {
         /// Exact number of speakers. Overrides `minSpeakers` and `maxSpeakers` when set.
         public var numSpeakers: Int?
 
+        /// Preserve initial AHC clusters when automatic diarization has no speaker-count constraints.
+        public var preserveAutomaticAHCClusters: Bool
+
         public static let community = Clustering(
             threshold: 0.6,
             warmStartFa: 0.07,
@@ -149,7 +156,8 @@ public struct OfflineDiarizerConfig: Sendable {
             warmStartFb: Double,
             minSpeakers: Int? = nil,
             maxSpeakers: Int? = nil,
-            numSpeakers: Int? = nil
+            numSpeakers: Int? = nil,
+            preserveAutomaticAHCClusters: Bool = false
         ) {
             self.threshold = threshold
             self.warmStartFa = warmStartFa
@@ -157,6 +165,7 @@ public struct OfflineDiarizerConfig: Sendable {
             self.minSpeakers = minSpeakers
             self.maxSpeakers = maxSpeakers
             self.numSpeakers = numSpeakers
+            self.preserveAutomaticAHCClusters = preserveAutomaticAHCClusters
         }
     }
 
@@ -388,6 +397,12 @@ public struct OfflineDiarizerConfig: Sendable {
         guard embedding.minSegmentDurationSeconds >= 0 else {
             throw OfflineDiarizationError.invalidConfiguration(
                 "embedding.minSegmentDuration must be >= 0"
+            )
+        }
+
+        guard embedding.minimumActiveRatio >= 0, embedding.minimumActiveRatio <= 1 else {
+            throw OfflineDiarizationError.invalidConfiguration(
+                "embedding.minimumActiveRatio must be within [0, 1], got \(embedding.minimumActiveRatio)"
             )
         }
 

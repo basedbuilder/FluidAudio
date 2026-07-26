@@ -592,7 +592,7 @@ public final class OfflineDiarizerManager {
         return selected
     }
 
-    private func computeCentroids(
+    func computeCentroids(
         trainingEmbeddings: [[Double]],
         vbxOutput: VBxOutput,
         initialClusters: [Int]
@@ -608,6 +608,17 @@ public final class OfflineDiarizerManager {
                 uniqueKeysWithValues: (0..<vbxOutput.centroids.count).map { ($0, $0) }
             )
             return (vbxOutput.centroids, mapping)
+        }
+
+        let hasSpeakerCountConstraints =
+            config.clustering.numSpeakers != nil
+            || config.clustering.minSpeakers != nil
+            || config.clustering.maxSpeakers != nil
+        if config.clustering.preserveAutomaticAHCClusters, !hasSpeakerCountConstraints {
+            return computeCentroidsFromClusters(
+                embeddings: trainingEmbeddings,
+                clusters: initialClusters
+            )
         }
 
         let epsilon = 1e-7

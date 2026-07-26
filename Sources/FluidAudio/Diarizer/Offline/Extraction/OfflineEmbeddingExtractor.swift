@@ -78,6 +78,14 @@ struct OfflineEmbeddingExtractor {
     private let modelBatchLimit: Int
     private let embeddingOutputName: String
 
+    static func meetsMinimumActiveRatio(
+        cleanActivity: Float,
+        frameCount: Int,
+        minimumActiveRatio: Float
+    ) -> Bool {
+        cleanActivity >= Float(frameCount) * minimumActiveRatio
+    }
+
     init(
         fbankModel: MLModel,
         embeddingModel: MLModel,
@@ -516,8 +524,11 @@ struct OfflineEmbeddingExtractor {
                 }
 
                 let cleanSum = VDSPOperations.sum(cleanMask)
-                let minActiveRatio: Float = 0.2
-                if cleanSum < Float(frameCount) * minActiveRatio {
+                if !Self.meetsMinimumActiveRatio(
+                    cleanActivity: cleanSum,
+                    frameCount: frameCount,
+                    minimumActiveRatio: config.embedding.minimumActiveRatio
+                ) {
                     maskPreparationDuration += maskStart.duration(to: clock.now)
                     emptyMaskCount += 1
                     continue
