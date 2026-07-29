@@ -58,10 +58,10 @@ Pod::Spec.new do |spec|
     core.dependency "#{spec.name}/FastClusterWrapper"
     core.dependency "#{spec.name}/MachTaskSelfWrapper"
     core.source_files = "Sources/FluidAudio/**/*.swift"
+    core.exclude_files = "Sources/FluidAudio/TTS/**/*.swift"
 
     # iOS Configuration
-    # TTS sources are moved under `Sources/FluidAudioTTS` and are not part of the Core subspec.
-    # iOS builds include ASR, Diarization, and VAD.
+    # TTS remains SwiftPM-only; CocoaPods Core includes ASR, Diarization, and VAD.
     core.ios.frameworks = "CoreML", "AVFoundation", "Accelerate", "UIKit"
 
     # macOS Configuration
