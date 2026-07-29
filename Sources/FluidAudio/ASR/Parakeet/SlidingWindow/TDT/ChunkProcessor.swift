@@ -511,6 +511,7 @@ struct ChunkProcessor {
                 modelVersion: modelVersion,
                 startTime: startTime,
                 progressHandler: progressHandler,
+                speechRmsThresholdProvider: { try adaptiveSpeechRmsThreshold() },
                 language: language
             )
         }
@@ -1385,7 +1386,7 @@ struct ChunkProcessor {
     /// a fresh seam-free window and splice in only in-gap tokens (issue
     /// #758). Genuine silence splices nothing. See "Post-Merge Repair Pass"
     /// in Documentation/ASR/LongTranscription.md.
-    private func repairSeamGaps(
+    internal func repairSeamGaps(
         in tokens: [TokenWindow],
         using manager: AsrManager,
         decoderLayers: Int,

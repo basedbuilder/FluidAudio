@@ -50,6 +50,7 @@ extension ChunkProcessor {
         modelVersion: AsrModelVersion?,
         startTime: Date,
         progressHandler: ((Double) async -> Void)?,
+        speechRmsThresholdProvider: () throws -> Float,
         language: Language?
     ) async throws -> ASRResult {
         let config = DualDecodeArbitrationConfig()
@@ -342,6 +343,25 @@ extension ChunkProcessor {
             mergedTokens = collapseSeamWordDuplicates(mergedTokens, vocabulary: vocabulary)
         } else if mergedTokens.count > 1 {
             mergedTokens.sort { $0.timestamp < $1.timestamp }
+        }
+
+        if chunkOutputs.count > 1, mergedTokens.count > 1, await manager.seamGapRepair {
+            let vocabulary = await manager.vocabulary
+            let spliceSafeTokenIds = Self.spliceSafeTokenIds(vocabulary: vocabulary)
+            let minGapSeconds = await manager.seamGapRepairMinGapSeconds
+            let speechRmsThreshold = try speechRmsThresholdProvider()
+
+            mergedTokens = try await repairSeamGaps(
+                in: mergedTokens,
+                using: worker,
+                decoderLayers: decoderLayers,
+                maxModelSamples: maxModelSamples,
+                minGapSeconds: minGapSeconds,
+                speechRmsThreshold: speechRmsThreshold,
+                spliceSafeTokenIds: spliceSafeTokenIds,
+                vocabulary: vocabulary,
+                language: language
+            )
         }
 
         let allTokens = mergedTokens.map { $0.token }
