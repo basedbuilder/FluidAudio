@@ -68,14 +68,19 @@ extension ChunkProcessor {
         let pathAStartsDecisions = try silenceAlignedChunkStarts(
             chunkSamples: chunkSamples,
             strideSamples: strideSamples,
-            canUseWarmupPrefix: false
+            canUseWarmupPrefix: false,
+            contentEndSamples: speechEnd
         )
         let pathBStartsDecisions = try silenceAlignedChunkStarts(
             chunkSamples: chunkSamples,
             strideSamples: strideSamples,
-            canUseWarmupPrefix: true
+            canUseWarmupPrefix: true,
+            contentEndSamples: speechEnd
         )
-        let pathCStartsDecisions = regularChunkStarts(strideSamples: strideSamples)
+        let pathCStartsDecisions = regularChunkStarts(
+            strideSamples: strideSamples,
+            contentEndSamples: speechEnd
+        )
 
         let pathBCount = pathBStartsDecisions.count
         let pathCCount = pathCStartsDecisions.count
@@ -380,22 +385,16 @@ extension ChunkProcessor {
             chunkSamples - warmupSamples
         )
         let candidateEnd = chunkStart + visibleChunkSamples
-        let isLastChunk = candidateEnd >= totalSamples
-        let chunkEnd = isLastChunk ? totalSamples : candidateEnd
+        let isLastChunk = candidateEnd >= speechEndSamples
+        let chunkEnd = isLastChunk ? speechEndSamples : candidateEnd
 
         if chunkEnd <= chunkStart {
-            return []
-        }
-        // The final window's audio stops at the last speech-bearing frame —
-        // a window ending inside a dead-silence run decodes degenerately.
-        let audioEnd = isLastChunk ? min(chunkEnd, speechEndSamples) : chunkEnd
-        if audioEnd <= chunkStart {
             return []
         }
 
         let contextSamples = 0
         let contextStart = chunkStart - warmupSamples
-        let chunkLengthWithContext = audioEnd - contextStart
+        let chunkLengthWithContext = chunkEnd - contextStart
         let chunkSamplesArray = try readSamples(offset: contextStart, count: chunkLengthWithContext)
         let emitTokensAfterFrame =
             warmupSamples > 0 ? chunkStart / ASRConstants.samplesPerEncoderFrame : nil

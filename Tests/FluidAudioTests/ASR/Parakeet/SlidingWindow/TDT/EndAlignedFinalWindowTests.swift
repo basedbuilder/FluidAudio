@@ -103,6 +103,46 @@ final class EndAlignedFinalWindowTests: XCTestCase {
             warmupTrimmed + (speechEnd - chunkStart), chunkSamples - frameSamples)
     }
 
+    func testSpeechEndMakesShortContentTailTerminalBeforeEOF() {
+        let processor = ChunkProcessor(audioSamples: [Float](repeating: 0, count: sampleRate))
+        let layout = processor.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        let chunkStart = layout.strideSamples
+        let speechEnd = chunkStart + 4 * frameSamples
+        let totalSamples = chunkStart + layout.chunkSamples + frameSamples
+
+        let warmup = ChunkProcessor.lastChunkWarmupSamples(
+            chunkStart: chunkStart,
+            defaultWarmupSamples: 0,
+            chunkSamples: layout.chunkSamples,
+            totalSamples: totalSamples,
+            speechEndSamples: speechEnd
+        )
+
+        XCTAssertGreaterThan(warmup, 0)
+        XCTAssertEqual(warmup, chunkStart / frameSamples * frameSamples)
+    }
+
+    func testChunkPlanningDoesNotScheduleAcrossGreaterThanStrideQuietTail() throws {
+        let probe = ChunkProcessor(audioSamples: [Float](repeating: 0, count: sampleRate))
+        let layout = probe.chunkLayoutForTesting(melChunkContext: false, modelVersion: .v3)
+        let speechEnd = layout.strideSamples + 4 * frameSamples
+        let totalSamples = speechEnd + layout.strideSamples + 4 * frameSamples
+        var samples = [Float](repeating: 0, count: totalSamples)
+        for index in 0..<speechEnd {
+            samples[index] = 0.05
+        }
+
+        let processor = ChunkProcessor(audioSamples: samples)
+        let starts = try processor.chunkStartsForTesting(melChunkContext: false, modelVersion: .v3)
+
+        XCTAssertEqual(try processor.speechEndSamples(), speechEnd)
+        XCTAssertFalse(starts.isEmpty)
+        XCTAssertTrue(
+            starts.allSatisfy { $0 < speechEnd },
+            "No decode window should start inside the terminal quiet tail"
+        )
+    }
+
     func testSpeechEndSamplesTrimsTrailingSilence() throws {
         // 2s of tone, then 2s of digital silence: the scan must stop at the
         // tone's end (within one frame).
