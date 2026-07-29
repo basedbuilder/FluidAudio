@@ -307,9 +307,19 @@ public final class OfflineDiarizerManager {
         } else {
             initialClusters = Array(repeating: 0, count: trainingEmbeddings.count)
         }
+        let clusteringSeed =
+            config.consolidatesOverlappingAutomaticClusters
+            ? OfflineTemporalClusterConsolidator.consolidate(
+                timedEmbeddings: trainingIndices.map { timedEmbeddings[$0] },
+                initialClusters: initialClusters,
+                segmentation: segmentation,
+                minimumSharedCleanDurationSeconds:
+                    config.embedding.minSegmentDurationSeconds
+            )
+            : initialClusters
 
         let vbxOutput: VBxOutput
-        if !trainingRho.isEmpty, !initialClusters.isEmpty {
+        if !trainingRho.isEmpty, !clusteringSeed.isEmpty {
             let hasConstraints =
                 config.clustering.numSpeakers != nil
                 || config.clustering.minSpeakers != nil
@@ -328,16 +338,16 @@ public final class OfflineDiarizerManager {
             vbxOutput = VBxClustering(config: config, pldaTransform: pldaTransform).refineWithConstraints(
                 rhoFeatures: trainingRho,
                 trainingEmbeddings: trainingEmbeddings,
-                initialClusters: initialClusters,
+                initialClusters: clusteringSeed,
                 constraints: constraints
             )
         } else {
             vbxOutput = VBxOutput(
                 gamma: [],
                 pi: [],
-                hardClusters: [initialClusters],
+                hardClusters: [clusteringSeed],
                 centroids: [],
-                numClusters: initialClusters.max().map { $0 + 1 } ?? 0,
+                numClusters: clusteringSeed.max().map { $0 + 1 } ?? 0,
                 elbos: []
             )
         }
@@ -345,16 +355,27 @@ public final class OfflineDiarizerManager {
         let centroidComputation = computeCentroids(
             trainingEmbeddings: trainingEmbeddings,
             vbxOutput: vbxOutput,
-            initialClusters: initialClusters
+            initialClusters: clusteringSeed
         )
         var centroids = centroidComputation.centroids
         if centroids.isEmpty {
             centroids = computeFallbackCentroids(from: embeddingFeatures)
         }
-        let assignments = assignEmbeddings(
+        var assignments = assignEmbeddings(
             embeddingFeatures: embeddingFeatures,
             centroids: centroids
         )
+        if config.consolidatesOverlappingAutomaticClusters {
+            for (trainingPosition, embeddingIndex) in trainingIndices.enumerated()
+            where clusteringSeed.indices.contains(trainingPosition)
+                && assignments.indices.contains(embeddingIndex)
+            {
+                let cluster = clusteringSeed[trainingPosition]
+                if let mappedCluster = centroidComputation.mapping[cluster] {
+                    assignments[embeddingIndex] = mappedCluster
+                }
+            }
+        }
 
         let chunkAssignments = buildChunkAssignments(
             segmentation: segmentation,
@@ -362,6 +383,15 @@ public final class OfflineDiarizerManager {
             assignments: assignments,
             clusterCount: centroids.count
         )
+        let frameLocalAssignments =
+            config.splitsDisconnectedSpeakerMasksForAutomaticDiarization
+            ? OfflineReconstruction.buildFrameLocalClusterAssignments(
+                segmentation: segmentation,
+                timedEmbeddings: timedEmbeddings,
+                assignments: assignments,
+                clusterCount: centroids.count
+            )
+            : nil
 
         let clusteringTime = Date().timeIntervalSince(clusteringStart)
         if !assignments.isEmpty {
@@ -402,7 +432,8 @@ public final class OfflineDiarizerManager {
             segmentation: segmentation,
             hardClusters: chunkAssignments,
             centroids: centroids,
-            spanEmbedder: spanEmbedder
+            spanEmbedder: spanEmbedder,
+            frameLocalClusters: frameLocalAssignments
         )
 
         let speakerDatabase = reconstruction.buildSpeakerDatabase(segments: segments)

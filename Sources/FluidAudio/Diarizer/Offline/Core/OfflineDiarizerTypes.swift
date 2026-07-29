@@ -98,6 +98,12 @@ public struct OfflineDiarizerConfig: Sendable {
         public var skipStrategy: EmbeddingSkipStrategy
         /// Minimum share of segmentation frames that must remain active after overlap exclusion.
         public var minimumActiveRatio: Float
+        /// Split one local segmentation speaker slot into separate embedding masks when
+        /// automatic diarization observes temporally disconnected speech runs.
+        ///
+        /// Disabled by default so existing callers retain one embedding per chunk/slot.
+        /// Speaker-count-constrained diarization also retains the existing behavior.
+        public var splitDisconnectedSpeakerMasks: Bool
 
         public static let community = Embedding(
             batchSize: 32,
@@ -111,13 +117,15 @@ public struct OfflineDiarizerConfig: Sendable {
             excludeOverlap: Bool,
             minSegmentDurationSeconds: Double,
             skipStrategy: EmbeddingSkipStrategy = .none,
-            minimumActiveRatio: Float = 0.2
+            minimumActiveRatio: Float = 0.2,
+            splitDisconnectedSpeakerMasks: Bool = false
         ) {
             self.batchSize = batchSize
             self.excludeOverlap = excludeOverlap
             self.minSegmentDurationSeconds = minSegmentDurationSeconds
             self.skipStrategy = skipStrategy
             self.minimumActiveRatio = minimumActiveRatio
+            self.splitDisconnectedSpeakerMasks = splitDisconnectedSpeakerMasks
         }
     }
 
@@ -539,6 +547,19 @@ public struct OfflineDiarizerConfig: Sendable {
     public var segmentationStepRatio: Double {
         get { segmentation.stepRatio }
         set { segmentation.stepRatio = newValue }
+    }
+
+    var splitsDisconnectedSpeakerMasksForAutomaticDiarization: Bool {
+        embedding.splitDisconnectedSpeakerMasks
+            && clustering.numSpeakers == nil
+            && clustering.minSpeakers == nil
+            && clustering.maxSpeakers == nil
+    }
+
+    var consolidatesOverlappingAutomaticClusters: Bool {
+        splitsDisconnectedSpeakerMasksForAutomaticDiarization
+            && embedding.excludeOverlap
+            && clustering.preserveAutomaticAHCClusters
     }
 
     public static var `default`: OfflineDiarizerConfig {

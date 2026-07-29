@@ -59,6 +59,17 @@ private struct OfflineChunkBatchInfo: Sendable {
     }
 }
 
+struct OfflineTemporalEmbeddingMask: Equatable, Sendable {
+    /// Frames that should receive the cluster selected from this embedding.
+    ///
+    /// The range follows the segmentation activity, including overlap frames.
+    let assignmentFrames: Range<Int>
+
+    /// Full-window embedding weights. Frames outside `assignmentFrames` and
+    /// frames marked as overlap are zero.
+    let embeddingWeights: [Float]
+}
+
 @available(macOS 14.0, iOS 17.0, *)
 struct OfflineEmbeddingExtractor {
     private let fbankModel: MLModel
@@ -84,6 +95,57 @@ struct OfflineEmbeddingExtractor {
         minimumActiveRatio: Float
     ) -> Bool {
         cleanActivity >= Float(frameCount) * minimumActiveRatio
+    }
+
+    static func disconnectedEmbeddingMasks(
+        baseMask: [Float],
+        overlapFrames: [Bool],
+        frameDuration: Double,
+        minimumInactiveGapDuration: Double,
+        activityThreshold: Float = 1e-3
+    ) -> [OfflineTemporalEmbeddingMask] {
+        guard frameDuration.isFinite, frameDuration > 0 else { return [] }
+
+        let activeFrames = baseMask.indices.filter { baseMask[$0] > activityThreshold }
+        guard let firstActive = activeFrames.first else { return [] }
+
+        let gapThreshold =
+            minimumInactiveGapDuration.isFinite
+            ? max(0, minimumInactiveGapDuration)
+            : Double.infinity
+        let durationEpsilon = frameDuration * 1e-6
+
+        var ranges: [Range<Int>] = []
+        var runStart = firstActive
+        var previousActive = firstActive
+
+        for activeFrame in activeFrames.dropFirst() {
+            let inactiveFrameCount = activeFrame - previousActive - 1
+            let inactiveDuration = Double(inactiveFrameCount) * frameDuration
+            if inactiveFrameCount > 0, inactiveDuration > gapThreshold + durationEpsilon {
+                ranges.append(runStart..<(previousActive + 1))
+                runStart = activeFrame
+            }
+            previousActive = activeFrame
+        }
+        ranges.append(runStart..<(previousActive + 1))
+
+        return ranges.map { assignmentFrames in
+            var embeddingWeights = [Float](repeating: 0, count: baseMask.count)
+            for frame in assignmentFrames {
+                let isOverlap =
+                    overlapFrames.indices.contains(frame)
+                    ? overlapFrames[frame]
+                    : false
+                if !isOverlap {
+                    embeddingWeights[frame] = baseMask[frame]
+                }
+            }
+            return OfflineTemporalEmbeddingMask(
+                assignmentFrames: assignmentFrames,
+                embeddingWeights: embeddingWeights
+            )
+        }
     }
 
     init(
@@ -516,109 +578,156 @@ struct OfflineEmbeddingExtractor {
                     continue
                 }
 
-                cleanMask = baseMask
-                if config.embeddingExcludeOverlap {
-                    for frame in 0..<frameCount where overlapFrames[frame] {
-                        cleanMask[frame] = 0
+                let preparedMasks: [OfflineTemporalEmbeddingMask]
+                if config.splitsDisconnectedSpeakerMasksForAutomaticDiarization {
+                    let temporalMasks = Self.disconnectedEmbeddingMasks(
+                        baseMask: baseMask,
+                        overlapFrames: overlapFrames,
+                        frameDuration: info.frameDuration,
+                        minimumInactiveGapDuration: max(
+                            config.minGapDuration,
+                            config.segmentationMinDurationOff
+                        ),
+                        activityThreshold: overlapThreshold
+                    )
+                    preparedMasks = temporalMasks.filter { mask in
+                        let cleanSum = VDSPOperations.sum(mask.embeddingWeights)
+                        let hasEnoughActivity = Self.meetsMinimumActiveRatio(
+                            cleanActivity: cleanSum,
+                            frameCount: mask.assignmentFrames.count,
+                            minimumActiveRatio: config.embedding.minimumActiveRatio
+                        )
+                        let hasCleanEvidence = cleanSum > 0
+                        if !hasEnoughActivity || !hasCleanEvidence {
+                            emptyMaskCount += 1
+                        }
+                        return hasEnoughActivity && hasCleanEvidence
                     }
-                }
-
-                let cleanSum = VDSPOperations.sum(cleanMask)
-                if !Self.meetsMinimumActiveRatio(
-                    cleanActivity: cleanSum,
-                    frameCount: frameCount,
-                    minimumActiveRatio: config.embedding.minimumActiveRatio
-                ) {
-                    maskPreparationDuration += maskStart.duration(to: clock.now)
-                    emptyMaskCount += 1
-                    continue
-                }
-                let maskToUse: [Float]
-                let maskSum: Float
-                if cleanSum >= Float(minFramesForEmbedding) {
-                    maskToUse = cleanMask
-                    maskSum = cleanSum
                 } else {
-                    maskToUse = baseMask
-                    maskSum = baseSum
-                    fallbackMaskCount += 1
+                    cleanMask = baseMask
+                    if config.embeddingExcludeOverlap {
+                        for frame in 0..<frameCount where overlapFrames[frame] {
+                            cleanMask[frame] = 0
+                        }
+                    }
+
+                    let cleanSum = VDSPOperations.sum(cleanMask)
+                    if !Self.meetsMinimumActiveRatio(
+                        cleanActivity: cleanSum,
+                        frameCount: frameCount,
+                        minimumActiveRatio: config.embedding.minimumActiveRatio
+                    ) {
+                        maskPreparationDuration += maskStart.duration(to: clock.now)
+                        emptyMaskCount += 1
+                        continue
+                    }
+                    let maskToUse: [Float]
+                    if cleanSum >= Float(minFramesForEmbedding) {
+                        maskToUse = cleanMask
+                    } else {
+                        maskToUse = baseMask
+                        fallbackMaskCount += 1
+                    }
+
+                    let firstActive = maskToUse.firstIndex(where: { $0 > overlapThreshold }) ?? 0
+                    let lastActive =
+                        maskToUse.lastIndex(where: { $0 > overlapThreshold }) ?? firstActive
+                    preparedMasks = [
+                        OfflineTemporalEmbeddingMask(
+                            assignmentFrames: firstActive..<(lastActive + 1),
+                            embeddingWeights: maskToUse
+                        )
+                    ]
                 }
 
                 let maskPrepEnd = clock.now
                 maskPreparationDuration += maskStart.duration(to: maskPrepEnd)
 
-                if maskSum <= 0 {
-                    emptyMaskCount += 1
+                if preparedMasks.isEmpty {
                     continue
                 }
 
-                let resampleStart = maskPrepEnd
-                let resampledMask = WeightInterpolation.resample(maskToUse, to: weightFrameCount)
-                let maskEnergy = VDSPOperations.sum(resampledMask)
-                let resampleEnd = clock.now
-                resampleDuration += resampleStart.duration(to: resampleEnd)
-                if maskEnergy <= 0 {
-                    emptyMaskCount += 1
-                    continue
-                }
-
-                // Check if we can reuse a cached embedding instead of running the model.
-                // Compares against the mask that PRODUCED the cached embedding (not a rolling
-                // previous mask) to prevent drift: M1→M2→M3 each differ by 5%, but M3 vs M1
-                // could differ by 15%. Pinning to the generating mask detects cumulative drift.
-                let embedding256: [Float]
-                if let threshold = skipThreshold,
-                    let cached = embeddingCache[speakerIndex],
-                    maskCosineSimilarity(maskToUse, cached.mask) >= threshold
-                {
-                    embedding256 = cached.embedding
-                    skippedEmbeddingCount += 1
-                } else {
-                    let embeddingStart = resampleEnd
-                    let weightsArray = try prepareWeightsInput(weights: resampledMask)
-                    embedding256 = try runEmbeddingModel(
-                        fbankFeatures: fbankFeatures,
-                        weightsArray: weightsArray
-                    )
-                    let embeddingEnd = clock.now
-                    embeddingDuration += embeddingStart.duration(to: embeddingEnd)
-
-                    // Cache the pre-resample mask that generated this embedding. The model
-                    // actually receives the resampled version, but cosine similarity is
-                    // approximately preserved through WeightInterpolation.resample's
-                    // deterministic linear interpolation. The skip condition is conservative:
-                    // pre-resample similarity ≥ threshold implies post-resample similarity,
-                    // but not vice versa — so we may miss some valid skips, never reuse wrongly.
-                    if skipThreshold != nil {
-                        embeddingCache[speakerIndex] = CachedSpeakerEmbedding(
-                            mask: maskToUse, embedding: embedding256)
+                for preparedMask in preparedMasks {
+                    let maskToUse = preparedMask.embeddingWeights
+                    let maskSum = VDSPOperations.sum(maskToUse)
+                    if maskSum <= 0 {
+                        emptyMaskCount += 1
+                        continue
                     }
-                }
 
-                let firstActive = maskToUse.firstIndex(where: { $0 > overlapThreshold }) ?? 0
-                let lastActive = maskToUse.lastIndex(where: { $0 > overlapThreshold }) ?? firstActive
-                let startTime = info.chunkOffsetSeconds + Double(firstActive) * info.frameDuration
-                let endTime = info.chunkOffsetSeconds + Double(lastActive + 1) * info.frameDuration
+                    let resampleStart = clock.now
+                    let resampledMask = WeightInterpolation.resample(maskToUse, to: weightFrameCount)
+                    let maskEnergy = VDSPOperations.sum(resampledMask)
+                    let resampleEnd = clock.now
+                    resampleDuration += resampleStart.duration(to: resampleEnd)
+                    if maskEnergy <= 0 {
+                        emptyMaskCount += 1
+                        continue
+                    }
 
-                processedMasks += 1
-                accumulatedMaskFrames += Double(maskSum)
+                    // Check if we can reuse a cached embedding instead of running the model.
+                    // Compares against the mask that PRODUCED the cached embedding (not a rolling
+                    // previous mask) to prevent drift: M1→M2→M3 each differ by 5%, but M3 vs M1
+                    // could differ by 15%. Pinning to the generating mask detects cumulative drift.
+                    let embedding256: [Float]
+                    if let threshold = skipThreshold,
+                        let cached = embeddingCache[speakerIndex],
+                        maskCosineSimilarity(maskToUse, cached.mask) >= threshold
+                    {
+                        embedding256 = cached.embedding
+                        skippedEmbeddingCount += 1
+                    } else {
+                        let embeddingStart = resampleEnd
+                        let weightsArray = try prepareWeightsInput(weights: resampledMask)
+                        embedding256 = try runEmbeddingModel(
+                            fbankFeatures: fbankFeatures,
+                            weightsArray: weightsArray
+                        )
+                        let embeddingEnd = clock.now
+                        embeddingDuration += embeddingStart.duration(to: embeddingEnd)
 
-                pendingEmbeddings.append(embedding256)
-                pendingMetadata.append(
-                    OfflineEmbeddingPending(
-                        chunkIndex: info.chunkIndex,
-                        speakerIndex: speakerIndex,
-                        startFrame: firstActive,
-                        endFrame: lastActive,
-                        frameWeights: maskToUse,
-                        startTime: startTime,
-                        endTime: endTime,
-                        embedding256: embedding256
+                        // Cache the pre-resample mask that generated this embedding. The model
+                        // actually receives the resampled version, but cosine similarity is
+                        // approximately preserved through WeightInterpolation.resample's
+                        // deterministic linear interpolation. The skip condition is conservative:
+                        // pre-resample similarity ≥ threshold implies post-resample similarity,
+                        // but not vice versa — so we may miss some valid skips, never reuse wrongly.
+                        if skipThreshold != nil {
+                            embeddingCache[speakerIndex] = CachedSpeakerEmbedding(
+                                mask: maskToUse, embedding: embedding256)
+                        }
+                    }
+
+                    let assignmentFrames = preparedMask.assignmentFrames
+                    let firstAssignedFrame = assignmentFrames.lowerBound
+                    let lastAssignedFrame = assignmentFrames.upperBound - 1
+                    let startTime =
+                        info.chunkOffsetSeconds
+                        + Double(firstAssignedFrame) * info.frameDuration
+                    let endTime =
+                        info.chunkOffsetSeconds
+                        + Double(lastAssignedFrame + 1) * info.frameDuration
+
+                    processedMasks += 1
+                    accumulatedMaskFrames += Double(maskSum)
+
+                    pendingEmbeddings.append(embedding256)
+                    pendingMetadata.append(
+                        OfflineEmbeddingPending(
+                            chunkIndex: info.chunkIndex,
+                            speakerIndex: speakerIndex,
+                            startFrame: firstAssignedFrame,
+                            endFrame: lastAssignedFrame,
+                            frameWeights: maskToUse,
+                            startTime: startTime,
+                            endTime: endTime,
+                            embedding256: embedding256
+                        )
                     )
-                )
 
-                if pendingEmbeddings.count == maxPLDABatch {
-                    try await flushPending()
+                    if pendingEmbeddings.count == maxPLDABatch {
+                        try await flushPending()
+                    }
                 }
             }
         }

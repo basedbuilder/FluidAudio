@@ -1,6 +1,12 @@
 import Accelerate
 import Foundation
 
+struct OfflineFrameLocalClusterAssignment: Equatable, Sendable {
+    let speakerIndex: Int
+    let frames: ClosedRange<Int>
+    let cluster: Int
+}
+
 struct OfflineReconstruction {
     private let config: OfflineDiarizerConfig
     private let logger = AppLogger(category: "OfflineReconstruction")
@@ -16,16 +22,60 @@ struct OfflineReconstruction {
         self.config = config
     }
 
+    static func buildFrameLocalClusterAssignments(
+        segmentation: SegmentationOutput,
+        timedEmbeddings: [TimedEmbedding],
+        assignments: [Int],
+        clusterCount: Int
+    ) -> [[OfflineFrameLocalClusterAssignment]] {
+        var grouped = Array(repeating: [OfflineFrameLocalClusterAssignment](), count: segmentation.numChunks)
+
+        for (embedding, cluster) in zip(timedEmbeddings, assignments) {
+            guard
+                grouped.indices.contains(embedding.chunkIndex),
+                embedding.speakerIndex >= 0,
+                embedding.speakerIndex < segmentation.numSpeakers,
+                cluster >= 0,
+                cluster < clusterCount,
+                embedding.startFrame <= embedding.endFrame
+            else {
+                continue
+            }
+
+            let chunkFrameCount =
+                segmentation.speakerWeights.indices.contains(embedding.chunkIndex)
+                ? segmentation.speakerWeights[embedding.chunkIndex].count
+                : segmentation.numFrames
+            let firstFrame = max(0, embedding.startFrame)
+            let lastFrame = min(chunkFrameCount - 1, embedding.endFrame)
+            guard firstFrame <= lastFrame else { continue }
+
+            grouped[embedding.chunkIndex].append(
+                OfflineFrameLocalClusterAssignment(
+                    speakerIndex: embedding.speakerIndex,
+                    frames: firstFrame...lastFrame,
+                    cluster: cluster
+                )
+            )
+        }
+
+        return grouped
+    }
+
     /// - Parameters:
     ///   - spanEmbedder: Optional closure that extracts an embedding over an exact audio
     ///     span `(startSeconds, endSeconds)`, returning `nil` on failure. Required by the
     ///     zero-vote re-embed post-pass (`config.zeroVoteReembed.enabled`); when absent
     ///     the pass is skipped and zero-vote frames keep the tie-break behavior.
+    ///   - frameLocalClusters: Optional sparse per-chunk run assignments. When present,
+    ///     these replace the chunk-wide assignment at each frame so disconnected runs in
+    ///     one local speaker slot may retain different global clusters.
     func buildSegments(
         segmentation: SegmentationOutput,
         hardClusters: [[Int]],
         centroids: [[Double]],
-        spanEmbedder: ((_ startSeconds: Double, _ endSeconds: Double) -> [Float]?)? = nil
+        spanEmbedder: ((_ startSeconds: Double, _ endSeconds: Double) -> [Float]?)? = nil,
+        frameLocalClusters: [[OfflineFrameLocalClusterAssignment]]? = nil
     ) -> [TimedSpeakerSegment] {
         guard segmentation.numChunks > 0, segmentation.numFrames > 0 else { return [] }
 
@@ -76,10 +126,25 @@ struct OfflineReconstruction {
                 }
 
                 let weights = chunkWeights[frameIndex]
+                let frameAssignments: [Int]
+                if let frameLocalClusters {
+                    var assignments = Array(repeating: -2, count: segmentation.numSpeakers)
+                    if frameLocalClusters.indices.contains(chunkIndex) {
+                        for assignment in frameLocalClusters[chunkIndex]
+                        where assignment.frames.contains(frameIndex)
+                            && assignments.indices.contains(assignment.speakerIndex)
+                        {
+                            assignments[assignment.speakerIndex] = assignment.cluster
+                        }
+                    }
+                    frameAssignments = assignments
+                } else {
+                    frameAssignments = chunkAssignments
+                }
                 var frameActivations = [Double](repeating: 0, count: clusterCount)
 
-                for speakerIndex in 0..<min(weights.count, chunkAssignments.count) {
-                    let cluster = chunkAssignments[speakerIndex]
+                for speakerIndex in 0..<min(weights.count, frameAssignments.count) {
+                    let cluster = frameAssignments[speakerIndex]
                     guard cluster >= 0, cluster < clusterCount else { continue }
                     let value = Double(weights[speakerIndex])
                     if value > frameActivations[cluster] {
@@ -169,7 +234,11 @@ struct OfflineReconstruction {
             let required = speakerCountPerFrame[frame]
             guard required > 0 else { continue }
             let ranked = activationSums[frame].enumerated().sorted { $0.element > $1.element }
-            let selected = ranked.prefix(required).map { $0.offset }
+            let eligible =
+                frameLocalClusters == nil
+                ? ranked
+                : ranked.filter { $0.element > 0 }
+            let selected = eligible.prefix(required).map { $0.offset }
             perFrameClusters[frame] = selected
         }
 
@@ -239,13 +308,14 @@ struct OfflineReconstruction {
     /// Zero-vote re-embed post-pass over the aggregated frame timeline.
     ///
     /// Speech-active frames whose vote sums are zero across all clusters carry no
-    /// clustering evidence at all (the active local speaker slot got assignment −2 in
-    /// every covering window), so the per-frame ranking tie-breaks them arbitrarily to
-    /// cluster 0. For each maximal contiguous zero-vote run of at least
+    /// clustering evidence at all. Legacy chunk-wide reconstruction initially follows
+    /// its existing ranking tie-break; sparse frame-local reconstruction leaves the
+    /// frame unassigned rather than inventing a zero-vote identity. For each maximal
+    /// contiguous zero-vote run of at least
     /// `config.zeroVoteReembed.minDurationSeconds`, re-embed the run's exact audio span
     /// and assign its frames to the closest speaker centroid regardless of margin.
     /// Segment boundaries then follow the run boundaries via the normal accumulator
-    /// machinery. A failed/NaN embedding keeps the tie-break behavior for that run.
+    /// machinery. A failed/NaN embedding keeps the current behavior for that run.
     private func applyZeroVoteReembed(
         perFrameClusters: inout [[Int]],
         speakerCountPerFrame: [Int],

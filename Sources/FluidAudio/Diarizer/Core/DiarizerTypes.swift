@@ -120,8 +120,10 @@ public struct PipelineTimings: Sendable, Codable {
 
 /// Per-chunk speaker embedding produced during offline diarization, surfaced for
 /// downstream consumers that need finer-grained data than `TimedSpeakerSegment`
-/// (e.g. cluster-level contamination correction). One entry per (segmentation
-/// chunk, powerset speaker slot) emitted by the embedding extraction step.
+/// (e.g. cluster-level contamination correction). By default there is one entry
+/// per (segmentation chunk, powerset speaker slot) emitted by the embedding
+/// extraction step. When disconnected speaker-mask splitting is enabled, one
+/// pair may have multiple entries distinguished by their time bounds.
 ///
 /// The `embedding256` field carries the L2-normalized speaker embedding;
 /// `rho128` carries the PLDA-whitened representation when a PLDA model is
