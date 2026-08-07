@@ -398,12 +398,13 @@ public final class OfflineDiarizerManager {
         }
 
         let reconstruction = OfflineReconstruction(config: config)
-        let segments = reconstruction.buildSegments(
+        let reconstructionOutput = reconstruction.buildSegmentOutputs(
             segmentation: segmentation,
             hardClusters: chunkAssignments,
             centroids: centroids,
             spanEmbedder: spanEmbedder
         )
+        let segments = reconstructionOutput.segments
 
         let speakerDatabase = reconstruction.buildSpeakerDatabase(segments: segments)
 
@@ -442,6 +443,7 @@ public final class OfflineDiarizerManager {
 
         return DiarizationResult(
             segments: segments,
+            speakerActivitySegments: reconstructionOutput.speakerActivitySegments,
             speakerDatabase: speakerDatabase,
             chunkEmbeddings: publicChunkEmbeddings,
             timings: timings

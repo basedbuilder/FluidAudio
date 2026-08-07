@@ -291,6 +291,64 @@ final class ChunkEmbeddingExposureTests: XCTestCase {
 }
 
 @available(macOS 13.0, iOS 16.0, *)
+final class SpeakerActivityExposureTests: XCTestCase {
+
+    func testOverlapRetainsSpeakerActivityWhileLegacySegmentsStayExclusive() {
+        var config = OfflineDiarizerConfig(
+            minSegmentDuration: 0.1,
+            minGapDuration: 0.05,
+            segmentationMinDurationOn: 0.0,
+            segmentationMinDurationOff: 0.0
+        )
+        config.exclusiveSegments = true
+
+        let segmentation = SegmentationOutput(
+            logProbs: [[[0]]],
+            speakerWeights: [
+                (0..<30).map { frame in
+                    switch frame {
+                    case 0..<10:
+                        return [Float(1), 0]
+                    case 10..<20:
+                        return [Float(1), 1]
+                    default:
+                        return [0, 1]
+                    }
+                }
+            ],
+            numChunks: 1,
+            numFrames: 30,
+            numSpeakers: 2,
+            chunkOffsets: [0],
+            frameDuration: 0.1
+        )
+
+        let output = OfflineReconstruction(config: config).buildSegmentOutputs(
+            segmentation: segmentation,
+            hardClusters: [[0, 1]],
+            centroids: [[1, 0], [0, 1]]
+        )
+        let result = DiarizationResult(
+            segments: output.segments,
+            speakerActivitySegments: output.speakerActivitySegments
+        )
+
+        XCTAssertEqual(segmentShapes(result.segments), [
+            "S1|0.0|2.0",
+            "S2|2.0|3.0",
+        ])
+        XCTAssertEqual(segmentShapes(result.speakerActivitySegments), [
+            "S1|0.0|2.0",
+            "S2|1.0|3.0",
+        ])
+    }
+
+    private func segmentShapes(_ segments: [TimedSpeakerSegment]) -> [String] {
+        segments.map { "\($0.speakerId)|\($0.startTimeSeconds)|\($0.endTimeSeconds)" }
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, *)
 final class ModelWarmupTests: XCTestCase {
 
     func testWarmupSingleInputInvokesPredictionsWithExpectedShape() throws {

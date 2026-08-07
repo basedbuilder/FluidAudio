@@ -2,6 +2,11 @@ import Accelerate
 import Foundation
 
 struct OfflineReconstruction {
+    struct SegmentOutputs {
+        let segments: [TimedSpeakerSegment]
+        let speakerActivitySegments: [TimedSpeakerSegment]
+    }
+
     private let config: OfflineDiarizerConfig
     private let logger = AppLogger(category: "OfflineReconstruction")
 
@@ -27,10 +32,30 @@ struct OfflineReconstruction {
         centroids: [[Double]],
         spanEmbedder: ((_ startSeconds: Double, _ endSeconds: Double) -> [Float]?)? = nil
     ) -> [TimedSpeakerSegment] {
-        guard segmentation.numChunks > 0, segmentation.numFrames > 0 else { return [] }
+        buildSegmentOutputs(
+            segmentation: segmentation,
+            hardClusters: hardClusters,
+            centroids: centroids,
+            spanEmbedder: spanEmbedder
+        ).segments
+    }
+
+    /// Reconstruct both overlap-preserving speaker activity and legacy presentation segments
+    /// from one aggregated segmentation and clustering pass.
+    func buildSegmentOutputs(
+        segmentation: SegmentationOutput,
+        hardClusters: [[Int]],
+        centroids: [[Double]],
+        spanEmbedder: ((_ startSeconds: Double, _ endSeconds: Double) -> [Float]?)? = nil
+    ) -> SegmentOutputs {
+        guard segmentation.numChunks > 0, segmentation.numFrames > 0 else {
+            return SegmentOutputs(segments: [], speakerActivitySegments: [])
+        }
 
         let frameDuration = segmentation.frameDuration
-        guard frameDuration > 0 else { return [] }
+        guard frameDuration > 0 else {
+            return SegmentOutputs(segments: [], speakerActivitySegments: [])
+        }
 
         let clusterCount = max(centroids.count, 1)
         let gapThreshold = max(config.minGapDuration, config.segmentationMinDurationOff)
@@ -233,7 +258,9 @@ struct OfflineReconstruction {
         }
 
         let merged = mergeSegments(rawSegments, gapThreshold: gapThreshold)
-        return sanitize(segments: merged)
+        let speakerActivitySegments = sanitizeActivitySegments(merged)
+        let segments = presentationSegments(from: speakerActivitySegments)
+        return SegmentOutputs(segments: segments, speakerActivitySegments: speakerActivitySegments)
     }
 
     /// Zero-vote re-embed post-pass over the aggregated frame timeline.
@@ -478,7 +505,7 @@ struct OfflineReconstruction {
         return Float(min(max(weighted / totalDuration, 0), 1))
     }
 
-    private func sanitize(segments: [TimedSpeakerSegment]) -> [TimedSpeakerSegment] {
+    private func sanitizeActivitySegments(_ segments: [TimedSpeakerSegment]) -> [TimedSpeakerSegment] {
         var ordered = segments.sorted { $0.startTimeSeconds < $1.startTimeSeconds }
         let minimumDuration = max(
             Float(config.minSegmentDuration),
@@ -488,11 +515,12 @@ struct OfflineReconstruction {
             ($0.endTimeSeconds - $0.startTimeSeconds) >= minimumDuration
         }
 
-        if config.exclusiveSegments {
-            ordered = excludeOverlaps(in: ordered)
-        }
-
         return ordered
+    }
+
+    private func presentationSegments(from speakerActivitySegments: [TimedSpeakerSegment]) -> [TimedSpeakerSegment] {
+        guard config.exclusiveSegments else { return speakerActivitySegments }
+        return excludeOverlaps(in: speakerActivitySegments)
     }
 
     private func chunkStartTime(

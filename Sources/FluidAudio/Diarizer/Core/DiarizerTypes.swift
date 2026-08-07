@@ -161,6 +161,13 @@ public struct ChunkEmbedding: Sendable, Codable {
 public struct DiarizationResult: Sendable {
     public let segments: [TimedSpeakerSegment]
 
+    /// Speaker activity reconstructed before exclusive presentation trimming.
+    ///
+    /// Offline diarization populates this with the same post-minimum-duration
+    /// reconstruction used to derive `segments`, retaining simultaneous speakers.
+    /// Other diarizers leave it empty when they do not expose separate activity data.
+    public let speakerActivitySegments: [TimedSpeakerSegment]
+
     /// Speaker database with embeddings (populated by offline pipelines for downstream use)
     public let speakerDatabase: [String: [Float]]?
 
@@ -174,11 +181,13 @@ public struct DiarizationResult: Sendable {
 
     public init(
         segments: [TimedSpeakerSegment],
+        speakerActivitySegments: [TimedSpeakerSegment] = [],
         speakerDatabase: [String: [Float]]? = nil,
         chunkEmbeddings: [ChunkEmbedding]? = nil,
         timings: PipelineTimings? = nil
     ) {
         self.segments = segments
+        self.speakerActivitySegments = speakerActivitySegments
         self.speakerDatabase = speakerDatabase
         self.chunkEmbeddings = chunkEmbeddings
         self.timings = timings
