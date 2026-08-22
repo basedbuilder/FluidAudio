@@ -21,7 +21,7 @@ final class OfflineDiarizerConfigTests: XCTestCase {
     }
 
     func testValidateThrowsForInvalidClusteringThreshold() {
-        let config = OfflineDiarizerConfig(clusteringThreshold: 1.5)
+        let config = OfflineDiarizerConfig(clusteringThreshold: 2.5)
 
         XCTAssertThrowsError(try config.validate()) { error in
             guard case OfflineDiarizationError.invalidConfiguration(let message) = error else {
@@ -291,7 +291,7 @@ final class ChunkEmbeddingExposureTests: XCTestCase {
 }
 
 @available(macOS 13.0, iOS 16.0, *)
-final class SpeakerActivityExposureTests: XCTestCase {
+final class OfflineModuleTests: XCTestCase {
 
     func testOverlapRetainsSpeakerActivityWhileLegacySegmentsStayExclusive() {
         var config = OfflineDiarizerConfig(
@@ -333,14 +333,20 @@ final class SpeakerActivityExposureTests: XCTestCase {
             speakerActivitySegments: output.speakerActivitySegments
         )
 
-        XCTAssertEqual(segmentShapes(result.segments), [
-            "S1|0.0|2.0",
-            "S2|2.0|3.0",
-        ])
-        XCTAssertEqual(segmentShapes(result.speakerActivitySegments), [
-            "S1|0.0|2.0",
-            "S2|1.0|3.0",
-        ])
+        XCTAssertEqual(
+            segmentShapes(result.segments),
+            [
+                "S1|0.0|2.0",
+                "S2|2.0|3.0",
+            ]
+        )
+        XCTAssertEqual(
+            segmentShapes(result.speakerActivitySegments),
+            [
+                "S1|0.0|2.0",
+                "S2|1.0|3.0",
+            ]
+        )
     }
 
     private func segmentShapes(_ segments: [TimedSpeakerSegment]) -> [String] {

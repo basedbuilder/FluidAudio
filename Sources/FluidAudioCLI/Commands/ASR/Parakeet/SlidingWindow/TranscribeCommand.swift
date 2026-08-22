@@ -209,7 +209,7 @@ enum TranscribeCommand {
         var parakeetVariant: StreamingModelVariant?
         var language: Language?
         var encoderPrecision: ParakeetEncoderPrecision = .int8
-        var melChunkContext = true
+        var melChunkContext: Bool? = nil
         var dualDecodeArbitration = false
         var seamGapRepair = true
         var streamingMode = false
@@ -316,6 +316,8 @@ enum TranscribeCommand {
                 }
             case "--no-mel-context":
                 parsed.melChunkContext = false
+            case "--mel-context":
+                parsed.melChunkContext = true
             case "--dual-decode-arbitration":
                 parsed.dualDecodeArbitration = true
             case "--no-seam-gap-repair":
@@ -932,6 +934,19 @@ enum TranscribeCommand {
             let loadTime = Date().timeIntervalSince(loadStart)
             logger.info("Models loaded in \(String(format: "%.2f", loadTime))s")
 
+            if let vocabPath = args.customVocabPath {
+                let (customVocab, ctcModels) = try await CustomVocabularyContext.loadWithCtcTokens(from: vocabPath)
+                if let unified = engine as? StreamingUnifiedAsrManager {
+                    try await unified.configureVocabularyBoosting(vocabulary: customVocab, ctcModels: ctcModels)
+                    logger.info("Vocabulary boosting enabled (\(customVocab.terms.count) terms)")
+                } else if let unifiedBatch = engine as? UnifiedAsrManager {
+                    try await unifiedBatch.configureVocabularyBoosting(vocabulary: customVocab, ctcModels: ctcModels)
+                    logger.info("Vocabulary boosting enabled (\(customVocab.terms.count) terms)")
+                } else {
+                    logger.warning("--custom-vocab is not supported for \(variant.displayName); ignoring")
+                }
+            }
+
             let audioFileURL = URL(fileURLWithPath: audioFile)
             let audioFileHandle = try AVAudioFile(forReading: audioFileURL)
             let format = audioFileHandle.processingFormat
@@ -1008,10 +1023,13 @@ enum TranscribeCommand {
                 --output-json <file>           Save full transcription to JSON
                 --model-version <v2|v3|110m>   ASR model version (default: v3)
                 --model-dir <path>             Local model directory (skips download)
-                --encoder-precision <int8|int4> Encoder quantization (default: int8)
+                --encoder-precision <int8|int8-v2|int4> Encoder quantization (default: int8;
+                                               int8-v2 = int8-linear rebuild, avoids #760)
                 --language <code>              Language hint (e.g., en, de, fr, es)
                 --custom-vocab <file>          Apply vocabulary boosting in batch mode
                 --no-mel-context               Disable 80ms mel-context prepend for long-form batch ASR
+                                               (default: disabled on v3, enabled otherwise)
+                --mel-context                  Force-enable the mel-context prepend (v3 opt-in)
                 --dual-decode-arbitration      Enable v3/no-mel long-form boundary arbitration
 
             STREAMING MODE OPTIONS (--streaming, SlidingWindowAsrManager):

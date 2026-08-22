@@ -18,14 +18,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: "6.1"
 
       - name: Cache Swift packages and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -33,19 +33,19 @@ jobs:
           key: ${{ runner.os }}-sortformer-${{ hashFiles('Package.swift') }}
 
       - name: Cache Sortformer models
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/Library/Application Support/FluidAudio/Models/diar-streaming-sortformer-coreml
           key: ${{ runner.os }}-sortformer-models-high-latency-${{ hashFiles('Sources/FluidAudio/Shared/Download/**') }}
 
       - name: Cache AMI dataset
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/FluidAudioDatasets/ami_official
           key: ${{ runner.os }}-ami-dataset
 
       - name: Cache AMI annotations
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: Datasets/ami_public_1.6.2
           key: ${{ runner.os }}-ami-annotations-1.6.2
@@ -130,7 +130,7 @@ jobs:
 
       - name: Comment PR with Benchmark Results
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const der = parseFloat('${{ steps.extract.outputs.DER }}');

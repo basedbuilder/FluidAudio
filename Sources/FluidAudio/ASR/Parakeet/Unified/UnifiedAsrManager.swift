@@ -69,6 +69,10 @@ public actor UnifiedAsrManager {
     private var lastTranscript: String = ""
     private var partialCallback: (@Sendable (String) -> Void)?
 
+    // Vocabulary boosting (issue #851): configured via
+    // configureVocabularyBoosting() before transcription.
+    private var vocabularyBoosting: VocabularyBoostingSession?
+
     public private(set) var mlConfiguration: MLModelConfiguration
 
     public init(
@@ -105,11 +109,23 @@ public actor UnifiedAsrManager {
         } else {
             encoderConfig = mlConfiguration
         }
-        self.encoder = try await MLModel.load(
-            contentsOf: directory.appendingPathComponent(
-                names.offlineEncoderFile(precision: encoderPrecision)),
-            configuration: encoderConfig
-        )
+        do {
+            self.encoder = try await MLModel.load(
+                contentsOf: directory.appendingPathComponent(
+                    names.offlineEncoderFile(precision: encoderPrecision)),
+                configuration: encoderConfig
+            )
+        } catch {
+            if encoderPrecision == .int8 {
+                // Same A-series caveat as the streaming manager (issue #828):
+                // the int8 encoder can fail on every compute unit from an
+                // intact download; name the fp16 escape hatch here.
+                logger.error(
+                    "int8 unified encoder failed to load. On some A-series chips (A16 verified) it cannot build an execution plan on any compute unit even from an intact download — retry with encoderPrecision: .fp16 (issue #828). Underlying error: \(error.localizedDescription)"
+                )
+            }
+            throw error
+        }
         self.decoder = try await MLModel.load(
             contentsOf: directory.appendingPathComponent(names.decoderFile),
             configuration: cpuConfig
@@ -149,29 +165,191 @@ public actor UnifiedAsrManager {
             .appendingPathComponent("Models", isDirectory: true)
 
         let cacheDir = modelsBaseDir.appendingPathComponent(repo.folderName)
-        let encoderPath = cacheDir.appendingPathComponent(
-            ModelNames.ParakeetUnified.offlineEncoderFile(precision: encoderPrecision))
 
-        if !FileManager.default.fileExists(atPath: encoderPath.path) {
-            logger.info("Downloading Parakeet Unified offline models to \(modelsBaseDir.path)...")
-            try await ModelHub.download(
-                repo, to: modelsBaseDir,
-                variant: encoderPrecision == .fp16 ? "offline-fp16" : "offline",
-                progressHandler: progressHandler)
-        } else {
-            logger.info("Using cached Parakeet Unified offline models at \(cacheDir.path)")
+        // Completeness-checked download + purge-and-retry on load failure: a
+        // bare directory-existence gate mistook an interrupted encoder fetch
+        // for a warm cache and bricked loading permanently (issue #819).
+        try await ModelHub.loadWithRecovery(
+            repo, directory: modelsBaseDir,
+            requiredFiles: [
+                ModelNames.ParakeetUnified.offlineEncoderFile(precision: encoderPrecision),
+                ModelNames.ParakeetUnified.decoderFile,
+                ModelNames.ParakeetUnified.jointDecisionFile,
+                ModelNames.ParakeetUnified.vocab,
+            ],
+            variant: encoderPrecision == .fp16 ? "offline-fp16" : "offline",
+            progressHandler: progressHandler
+        ) {
+            try await self.loadModels(from: cacheDir)
         }
+    }
 
-        try await loadModels(from: cacheDir)
+    // MARK: - Vocabulary Boosting
+
+    /// Configure vocabulary boosting for batch transcription.
+    ///
+    /// When configured, the final merged transcript of each `transcribe` call
+    /// is rescored against CTC acoustic evidence: a separate CTC model runs
+    /// over the same audio and vocabulary terms replace misrecognized words
+    /// where the acoustics support it. Same pipeline as
+    /// `SlidingWindowAsrManager.configureVocabularyBoosting`.
+    ///
+    /// - Parameters:
+    ///   - vocabulary: Custom vocabulary context with terms to detect
+    ///     (tokenize via `CustomVocabularyContext.loadWithCtcTokens`)
+    ///   - ctcModels: Pre-loaded CTC models for keyword spotting
+    ///   - config: Optional rescorer configuration (default:
+    ///     `VocabularyBoostingSession.itnDefaultConfig` — this engine's ITN
+    ///     output needs the #702 spotter-rescue similarity floors)
+    /// - Throws: Error if rescorer initialization fails
+    public func configureVocabularyBoosting(
+        vocabulary: CustomVocabularyContext,
+        ctcModels: CtcModels,
+        config: VocabularyRescorer.Config? = nil
+    ) async throws {
+        self.vocabularyBoosting = try await VocabularyBoostingSession(
+            vocabulary: vocabulary, ctcModels: ctcModels,
+            config: config ?? VocabularyBoostingSession.itnDefaultConfig
+        )
+        logger.info("Vocabulary boosting configured with \(vocabulary.terms.count) terms")
     }
 
     // MARK: - Batch API
+
+    /// A transcript and the per-token timings behind it.
+    public struct TranscriptionWithTimings: Sendable {
+        public let text: String
+        public let tokenTimings: [TokenTiming]
+
+        public init(text: String, tokenTimings: [TokenTiming]) {
+            self.text = text
+            self.tokenTimings = tokenTimings
+        }
+    }
 
     /// Transcribe 16 kHz mono samples of arbitrary length using overlapping
     /// 15 s windows.
     public func transcribe(_ samples: [Float]) async throws -> String {
         guard let tokenizer = tokenizer else { throw ASRError.notInitialized }
+        let merged = try await decodedTokens(samples, tokenizer: tokenizer)
+        let text = tokenizer.decode(ids: merged.map(\.token))
+        return await rescoreIfConfigured(text: text, merged: merged, samples: samples)
+    }
 
+    /// Transcribe as `transcribe(_:)` does, additionally reporting the encoder
+    /// frame each token was emitted at, converted to seconds.
+    ///
+    /// The offline path already carries these frames — the greedy RNNT decoder
+    /// records one per emission and the overlap merge preserves them — so this
+    /// costs nothing beyond the conversion. It is the batch counterpart to
+    /// `StreamingUnifiedAsrManager.consumeTokenTimings()`, and its output feeds
+    /// `buildWordTimings(from:)` the same way, for callers that need to align
+    /// the transcript back to the audio (seeking, playback highlighting,
+    /// word→speaker attribution).
+    ///
+    /// As in the streaming manager, RNNT tokens are emitted *at* a frame and
+    /// have no intrinsic duration, so every token gets a provisional one-frame
+    /// end that is clamped back only when it would overrun its successor. The
+    /// spans are therefore not contiguous: a real pause stays visible as a gap
+    /// between one token's end and the next one's start. The last token keeps
+    /// its provisional end, clamped to the end of the clip. These are emission
+    /// times rather than forced-alignment boundaries: the decoder emits once it
+    /// has heard enough context, so a token's start can sit slightly after the
+    /// word's true onset.
+    public func transcribeWithTimings(_ samples: [Float]) async throws -> TranscriptionWithTimings {
+        guard let tokenizer = tokenizer else { throw ASRError.notInitialized }
+        let merged = try await decodedTokens(samples, tokenizer: tokenizer)
+        let timings = Self.tokenTimings(
+            from: merged,
+            secondsPerFrame: Double(config.frameSamples) / Double(config.sampleRate),
+            vocabulary: tokenizer.vocabulary,
+            clipDuration: Double(samples.count) / Double(config.sampleRate)
+        )
+        var text = tokenizer.decode(ids: merged.map(\.token))
+        // Rescored text can replace words, so token timings no longer decode
+        // to the text verbatim; they remain the raw emissions, which is what
+        // timing consumers (seek, attribution) want.
+        if let boosting = vocabularyBoosting,
+            let rescored = await boosting.rescore(text: text, tokenTimings: timings, audioSamples: samples)
+        {
+            text = rescored.text
+        }
+        return TranscriptionWithTimings(text: text, tokenTimings: timings)
+    }
+
+    /// Apply vocabulary rescoring to a finished transcript when boosting is
+    /// configured; otherwise return the transcript unchanged.
+    private func rescoreIfConfigured(
+        text: String, merged: [ChunkProcessor.TokenWindow], samples: [Float]
+    ) async -> String {
+        guard let boosting = vocabularyBoosting, let tokenizer = tokenizer else { return text }
+        let timings = Self.tokenTimings(
+            from: merged,
+            secondsPerFrame: Double(config.frameSamples) / Double(config.sampleRate),
+            vocabulary: tokenizer.vocabulary,
+            clipDuration: Double(samples.count) / Double(config.sampleRate)
+        )
+        let rescored = await boosting.rescore(text: text, tokenTimings: timings, audioSamples: samples)
+        return rescored?.text ?? text
+    }
+
+    /// Emission frames → seconds. Pure, so the back-fill rule can be tested
+    /// without loading a 600M parameter model.
+    ///
+    /// `clipDuration` bounds the last token's provisional end, which the batch
+    /// path can do because it knows the sample count up front and the streaming
+    /// one cannot. Pass `nil` to leave it unbounded.
+    static func tokenTimings(
+        from emissions: [ChunkProcessor.TokenWindow],
+        secondsPerFrame: Double,
+        vocabulary: [Int: String],
+        clipDuration: Double? = nil
+    ) -> [TokenTiming] {
+        var timings: [TokenTiming] = []
+        timings.reserveCapacity(emissions.count)
+        for emission in emissions {
+            guard let piece = vocabulary[emission.token] else { continue }
+            let start = Double(emission.timestamp) * secondsPerFrame
+            // RNNT tokens have no intrinsic duration — back-fill the previous
+            // token's end to this token's start so durations reflect real gaps.
+            if let last = timings.indices.last, timings[last].endTime > start {
+                let previous = timings[last]
+                timings[last] = TokenTiming(
+                    token: previous.token, tokenId: previous.tokenId,
+                    startTime: previous.startTime, endTime: max(previous.startTime, start),
+                    confidence: previous.confidence
+                )
+            }
+            // Frontier token: provisional one-frame end, as in the streaming manager.
+            timings.append(
+                TokenTiming(
+                    token: piece.replacingOccurrences(of: "\u{2581}", with: " "),
+                    tokenId: emission.token,
+                    startTime: start,
+                    endTime: start + secondsPerFrame,
+                    confidence: emission.confidence
+                )
+            )
+        }
+        // The frontier token's one-frame end is a guess; offline knows where the
+        // audio actually stops, so don't hand callers a seek target past EOF.
+        if let clipDuration, let last = timings.indices.last, timings[last].endTime > clipDuration {
+            let previous = timings[last]
+            timings[last] = TokenTiming(
+                token: previous.token, tokenId: previous.tokenId,
+                startTime: previous.startTime, endTime: max(previous.startTime, clipDuration),
+                confidence: previous.confidence
+            )
+        }
+        return timings
+    }
+
+    /// The merged, seam-collapsed token stream for the whole recording, in
+    /// emission order. Shared by both batch entry points so the text they
+    /// return cannot drift apart.
+    private func decodedTokens(
+        _ samples: [Float], tokenizer: Tokenizer
+    ) async throws -> [ChunkProcessor.TokenWindow] {
         var merged: [ChunkProcessor.TokenWindow] = []
         // Reuse the TDT overlap merger to dedupe adjacent windows.
         let merger = ChunkProcessor(audioSamples: samples)
@@ -199,8 +377,7 @@ public actor UnifiedAsrManager {
         }
 
         merged.sort { $0.timestamp < $1.timestamp }
-        merged = merger.collapseSeamWordDuplicates(merged, vocabulary: tokenizer.vocabulary)
-        return tokenizer.decode(ids: merged.map(\.token))
+        return merger.collapseSeamWordDuplicates(merged, vocabulary: tokenizer.vocabulary)
     }
 
     /// Transcribe an audio buffer (any format; resampled to 16 kHz mono).

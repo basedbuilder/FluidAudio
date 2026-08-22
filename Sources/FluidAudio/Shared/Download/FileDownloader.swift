@@ -53,8 +53,10 @@ enum FileDownloader {
         }
 
         private func cancelWaiter(_ waiterID: UUID, for destination: String) {
-            guard var destinationWaiters = waiters[destination],
-                  let index = destinationWaiters.firstIndex(where: { $0.id == waiterID }) else {
+            guard
+                var destinationWaiters = waiters[destination],
+                let index = destinationWaiters.firstIndex(where: { $0.id == waiterID })
+            else {
                 return
             }
             let waiter = destinationWaiters.remove(at: index)
@@ -1072,10 +1074,34 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
     /// cancels the task if fewer than `minStallBytes` arrived since the last
     /// wake — catching a frozen CDN connection in seconds rather than waiting
     /// out the request's idle `timeout`.
+    ///
+    /// When `cancel()` already ran (a pre-cancelled Swift task fires its
+    /// cancellation handler before the operation body), the continuation is
+    /// failed here directly: the URLSession task is cancelled before its
+    /// `resume()`, so it never loads and never delivers
+    /// `didCompleteWithError` — waiting on the delegate would hang.
     func attach(
         continuation: CheckedContinuation<HTTPURLResponse, Error>,
         task: URLSessionDataTask
     ) {
+        let alreadyCancelled = state.withLockUnchecked { st -> Bool in
+            if st.cancellationRequested {
+                st.finished = true
+                st.resolutionCommitted = true
+                return true
+            }
+            st.continuation = continuation
+            st.task = task
+            st.receivedBytes = resumeOffset
+            st.bytesAtWindowStart = resumeOffset
+            return false
+        }
+        if alreadyCancelled {
+            task.cancel()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+
         let timer: DispatchSourceTimer? =
             (minStallBytes > 0 && stallWindow > 0)
             ? DispatchSource.makeTimerSource(queue: Self.watchdogQueue) : nil
@@ -1084,20 +1110,13 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
             timer.setEventHandler { [weak self] in self?.checkStall() }
             timer.resume()
         }
-        let shouldCancel = state.withLockUnchecked { st in
-            st.continuation = continuation
-            st.task = task
+        let shouldDiscardTimer = state.withLockUnchecked { st in
+            guard !st.finished, !st.cancellationRequested else { return true }
             st.watchdog = timer
-            st.receivedBytes = resumeOffset
-            st.bytesAtWindowStart = resumeOffset
-            if st.cancellationRequested {
-                st.watchdog = nil
-            }
-            return st.cancellationRequested
+            return false
         }
-        if shouldCancel {
+        if shouldDiscardTimer {
             timer?.cancel()
-            task.cancel()
         }
     }
 

@@ -10,6 +10,7 @@ final class OfflineConfigTests: XCTestCase {
         XCTAssertNil(clustering.maxSpeakers)
         XCTAssertNil(clustering.numSpeakers)
         XCTAssertFalse(clustering.preserveAutomaticAHCClusters)
+        XCTAssertTrue(clustering.constrainedAssignment)
     }
 
     func testEmbeddingMinimumActiveRatioDefaultsToPointTwo() {

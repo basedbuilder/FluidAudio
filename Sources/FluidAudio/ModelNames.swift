@@ -11,6 +11,11 @@ public enum Repo: String, CaseIterable, Sendable {
     /// 3-stage: fp32 CPU preprocessor (waveform→560-d LFR feats) + fp16 ANE
     /// encoder+CTC (+ fp32 fallback) + host greedy-CTC decode. See ASR/SenseVoice.
     case senseVoiceSmall = "FluidInference/sensevoice-small-coreml"
+    /// CAM++ speaker-embedding model (fbank80 -> 192-d) for speaker verification /
+    /// diarization clustering. See Speaker/CampPlusEmbedder.
+    case campPlus = "FluidInference/campplus-coreml"
+    /// FSMN-VAD voice activity detection (FunASR). See VAD/Fsmn.
+    case fsmnVad = "FluidInference/fsmn-vad-coreml"
     /// Paraformer-large (zh) — non-autoregressive ASR: SANM encoder + CIF
     /// predictor (host-side integrate-and-fire) + parallel decoder. See ASR/Paraformer.
     case paraformerLargeZh = "FluidInference/paraformer-large-zh-coreml"
@@ -54,6 +59,13 @@ public enum Repo: String, CaseIterable, Sendable {
     case multilingualG2p = "FluidInference/charsiu-g2p-byt5-coreml"
     case parakeetTdtCtc110m = "FluidInference/parakeet-tdt-ctc-110m-coreml"
     case cohereTranscribeCoreml = "FluidInference/cohere-transcribe-03-2026-coreml/q8"
+    /// Canary-1B-v2 (NVIDIA) — attention encoder-decoder (AED) ASR, 25 European
+    /// languages, 16384-token SentencePiece BPE. 4-stage CoreML pipeline:
+    /// fp32/CPU preprocessor (waveform→mel) + FastConformer encoder + autoregressive
+    /// Transformer decoder (full-sequence re-run per step) + 1024→16384 projection,
+    /// greedy until EOS (id 3). int4 encoder/decoder run on ANE (iOS18); fp16 is the
+    /// iOS17 parity fallback. See ASR/Canary.
+    case canary1bV2 = "FluidInference/canary-1b-v2-coreml"
     /// StyleTTS2 LibriTTS — `iteration_3/compiled/` is the only directory
     /// with `.mlmodelc` artifacts; the parent repo also ships `packages/`
     /// (`.mlpackage` source) and `swift/` (a debug harness) that the Swift
@@ -65,6 +77,12 @@ public enum Repo: String, CaseIterable, Sendable {
     /// recipe. Ships four `.mlmodelc` bundles + `tts.json` +
     /// `unicode_indexer.json` at the repo root.
     case supertonic3 = "FluidInference/supertonic-3-coreml"
+    /// NeuTTS-2E emotional English TTS (Qwen3 236M backbone + NeuCodec
+    /// decoder). Compiled `.mlmodelc` bundles + `tokenizer.json` +
+    /// `samples/<speaker>.json` reference codes at the repo root; the
+    /// `.mlpackage` sources alongside them are never downloaded. Conversion
+    /// lives in mobius (`models/tts/neutts-2e/coreml`).
+    case neuTts = "FluidInference/neutts-2e-coreml"
     /// LuxTTS (ZipVoice-Distill) — 48 kHz zero-shot voice-cloning TTS.
     /// Two decoder graphs per fixed shape bucket: `gpu/` (original graph,
     /// macOS GPU path) and `ane/` (ANE-canonical rewrite, iOS path), plus
@@ -72,10 +90,18 @@ public enum Repo: String, CaseIterable, Sendable {
     /// `tokens.txt` / `config.json`. Conversion lives in mobius
     /// (`models/tts/zipvoice`).
     case luxtts = "FluidInference/luxtts-coreml"
+    /// Inflect v2 (Micro / Nano) — ultra-tiny VITS-family English TTS. One repo
+    /// with two variant subdirectories (`micro/`, `nano/`), each holding
+    /// `encoder.mlmodelc` + 8 `synthesizer_f<N>.mlmodelc` frame buckets.
+    /// Conversion lives in mobius (`models/tts/inflect-v2`).
+    case inflectMicro = "FluidInference/inflect-v2-coreml/micro"
+    case inflectNano = "FluidInference/inflect-v2-coreml/nano"
 
     /// Repository slug (without owner)
     public var name: String {
         switch self {
+        case .neuTts:
+            return "neutts-2e-coreml"
         case .nemotronMultilingual:
             return "Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML"
         case .vad:
@@ -90,6 +116,10 @@ public enum Repo: String, CaseIterable, Sendable {
             return "parakeet-ctc-0.6b-coreml"
         case .senseVoiceSmall:
             return "sensevoice-small-coreml"
+        case .campPlus:
+            return "campplus-coreml"
+        case .fsmnVad:
+            return "fsmn-vad-coreml"
         case .paraformerLargeZh:
             return "paraformer-large-zh-coreml"
         case .parakeetJa:
@@ -136,12 +166,18 @@ public enum Repo: String, CaseIterable, Sendable {
             return "parakeet-tdt-ctc-110m-coreml"
         case .cohereTranscribeCoreml:
             return "cohere-transcribe-03-2026-coreml/q8"
+        case .canary1bV2:
+            return "canary-1b-v2-coreml"
         case .styletts2:
             return "StyleTTS-2-coreml/iteration_3/compiled"
         case .supertonic3:
             return "supertonic-3-coreml"
         case .luxtts:
             return "luxtts-coreml"
+        case .inflectMicro:
+            return "inflect-v2-coreml/micro"
+        case .inflectNano:
+            return "inflect-v2-coreml/nano"
         }
     }
 
@@ -170,6 +206,8 @@ public enum Repo: String, CaseIterable, Sendable {
             return "FluidInference/cohere-transcribe-03-2026-coreml"
         case .styletts2:
             return "FluidInference/StyleTTS-2-coreml"
+        case .inflectMicro, .inflectNano:
+            return "FluidInference/inflect-v2-coreml"
         default:
             return "FluidInference/\(name)"
         }
@@ -208,6 +246,10 @@ public enum Repo: String, CaseIterable, Sendable {
             return "q8"
         case .styletts2:
             return "iteration_3/compiled"
+        case .inflectMicro:
+            return "micro"
+        case .inflectNano:
+            return "nano"
         default:
             return nil
         }
@@ -262,6 +304,10 @@ public enum Repo: String, CaseIterable, Sendable {
             return "styletts2"
         case .supertonic3:
             return "supertonic-3"
+        case .inflectMicro:
+            return "inflect-v2-coreml/micro"
+        case .inflectNano:
+            return "inflect-v2-coreml/nano"
         default:
             return name.replacingOccurrences(of: "-coreml", with: "")
         }
@@ -271,12 +317,21 @@ public enum Repo: String, CaseIterable, Sendable {
 /// Encoder precision for the v3 Parakeet TDT 0.6B encoder.
 public enum ParakeetEncoderPrecision: String, Sendable, CaseIterable {
     case int8
+    /// Opt-in int8 per-channel linear re-quantization of the v3 encoder
+    /// (`Encoder_v2.mlmodelc`, 568M vs 425M). Avoids token corruption the
+    /// original 6-bit-LUT palettized `Encoder.mlmodelc` exhibits under
+    /// specific right-context (issue #760). `.int8` remains the default and
+    /// keeps loading the original file; select this explicitly to use the
+    /// rebuild.
+    case int8V2 = "int8-v2"
     case int4
 
     public var encoderFileName: String {
         switch self {
         case .int8:
             return ModelNames.ASR.encoderFile
+        case .int8V2:
+            return ModelNames.ASR.encoderV2File
         case .int4:
             return ModelNames.ASR.encoderInt4File
         }
@@ -433,6 +488,10 @@ public enum ModelNames {
         /// Joint decoder variant for v3 that exposes top-K outputs
         /// (`top_k_ids`, `top_k_logits`) used for language-aware script filtering.
         public static let jointV3File = "JointDecisionv3.mlmodelc"
+        /// v3 encoder re-quantized as int8 per-channel linear (issue #760).
+        /// Published alongside the immutable original `Encoder.mlmodelc`;
+        /// HF repo files are never mutated in place, fixes ship as new names.
+        public static let encoderV2File = "Encoder_v2.mlmodelc"
         public static let encoderInt4File = "EncoderInt4.mlmodelc"
         public static let ctcHeadFile = ctcHead + ".mlmodelc"
 
@@ -521,6 +580,70 @@ public enum ModelNames {
         }
 
         public static let requiredModels: Set<String> = requiredModels()
+    }
+
+    /// CAM++ speaker-embedding model names (2 CoreML stages).
+    ///   Preprocessor (fp32/CPU): waveform -> 80-d fbank
+    ///   CamPlusPlus (fp16/ANE): fbank -> 192-d speaker embedding
+    public enum CampPlus {
+        public static let preprocessor = "CamPlusPreprocessor"
+        public static let model = "CamPlusPlus"
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let modelFile = model + ".mlmodelc"
+
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            modelFile,
+        ]
+    }
+
+    /// FSMN-VAD model names (2 CoreML stages + host decision).
+    ///   Preprocessor (fp32/CPU): waveform -> 400-d features (fbank80 + LFR m=5,n=1)
+    ///   FsmnVad (fp16/ANE): features -> [1,T,248] frame scores (col 0 = silence prob)
+    /// Plus `vad_config.json` (auto-fetched as a root file).
+    public enum FsmnVad {
+        public static let preprocessor = "FsmnVadPreprocessor"
+        public static let scorer = "FsmnVad"
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let scorerFile = scorer + ".mlmodelc"
+
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            scorerFile,
+        ]
+    }
+
+    /// Canary-1B-v2 (AED) model names. 4 CoreML stages + host greedy loop:
+    ///   Preprocessor (fp32/CPU): waveform [1,240000] -> mel [1,128,1501]
+    ///   Encoder (int4 ANE / fp16): mel -> encoder [1,1024,188]
+    ///   Decoder (int4 ANE / fp16): autoregressive transformer hidden states
+    ///   Projection (fp16/ANE): hidden [1,1024] -> logits [1,16384]
+    /// Plus `vocab.json` (16384 SentencePiece pieces, id -> piece). int4 needs iOS18.
+    public enum Canary {
+        public static let preprocessor = "Preprocessor"
+        public static let projection = "Projection"
+        public static let encoder = "Encoder"  // fp16, ANE, iOS17
+        public static let encoderInt4 = "EncoderInt4"  // int4, ANE, iOS18 (default)
+        public static let encoderInt8 = "EncoderInt8"  // int8, CPU-only
+        public static let decoder = "Decoder"  // fp16
+        public static let decoderInt4 = "DecoderInt4"  // int4 (default)
+        public static let decoderInt8 = "DecoderInt8"  // int8, CPU-only
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let projectionFile = projection + ".mlmodelc"
+        public static let vocabularyFile = "vocab.json"
+
+        public static func requiredModels(precision: CanaryPrecision = .int4) -> Set<String> {
+            [
+                preprocessorFile,
+                projectionFile,
+                precision.encoderName + ".mlmodelc",
+                precision.decoderName + ".mlmodelc",
+                vocabularyFile,
+            ]
+        }
     }
 
     /// Paraformer-large (zh) model names. 4 CoreML stages + host CIF:
@@ -976,6 +1099,13 @@ public enum ModelNames {
         public static let pocketState = "pocket_state"
         public static let mimiDecoder = "mimi_decoder"
         public static let mimiEncoder = "mimi_encoderv2"
+        /// Per-language voice-cloning encoder, stored inside each pack's
+        /// directory (`v2.1/<lang>/mimi_encoderv3.mlmodelc`). Every language
+        /// pack ships its own mimi weights, so cloned-voice conditioning must
+        /// be encoded with the pack's own codec + speaker projection (baked
+        /// in at conversion). The shared root `mimi_encoderv2` (English mimi)
+        /// remains the fallback for English and stale caches (#793).
+        public static let mimiEncoderV3 = "mimi_encoderv3"
 
         /// Function names inside the `pocket_state` multifunction package.
         public enum StateFunction {
@@ -995,6 +1125,7 @@ public enum ModelNames {
         public static let pocketStateFile = pocketState + ".mlmodelc"
         public static let mimiDecoderFile = mimiDecoder + ".mlmodelc"
         public static let mimiEncoderFile = mimiEncoder + ".mlmodelc"
+        public static let mimiEncoderV3File = mimiEncoderV3 + ".mlmodelc"
 
         /// Directory containing binary constants, tokenizer, and voice data.
         public static let constantsBinDir = "constants_bin"
@@ -1242,6 +1373,23 @@ public enum ModelNames {
         }
     }
 
+    /// Inflect v2 (Micro / Nano) — VITS-family English TTS. Each variant
+    /// subdirectory holds a fixed-shape `encoder` and 8 `synthesizer_f<N>`
+    /// frame buckets. File names match `FluidInference/inflect-v2-coreml/<v>/`.
+    public enum Inflect {
+        public static let encoderFile = "encoder.mlmodelc"
+        public static let frameBuckets = [256, 384, 512, 640, 768, 896, 1024, 2048]
+
+        public static func synthesizerFile(frames: Int) -> String {
+            "synthesizer_f\(frames).mlmodelc"
+        }
+
+        /// Encoder + all 8 synthesizer buckets (downloaded up front; buckets
+        /// load lazily).
+        public static let requiredModels: Set<String> = Set(
+            [encoderFile] + frameBuckets.map { synthesizerFile(frames: $0) })
+    }
+
     /// LuxTTS (ZipVoice-Distill) model names. The HF repo publishes the same
     /// text encoder + flow-matching decoder in two graph layouts:
     ///   - `gpu/`  — original graph; fastest on Mac GPU (do NOT run on ANE:
@@ -1390,7 +1538,10 @@ public enum ModelNames {
         // re-download. See mobius laishere-coreml docs/trials-and-errors.md.
         public static let noise = "KokoroNoise_v2.mlmodelc"
         public static let vocoder = "KokoroVocoder.mlmodelc"
-        public static let tail = "KokoroTail.mlmodelc"
+        // v2: COLA-normalized iSTFT deconv weights (raw output was exactly 1.5x
+        // the PyTorch reference). Renamed (not overwritten) so cached clients
+        // re-download. See issue #852.
+        public static let tail = "KokoroTail_v2.mlmodelc"
 
         /// Auxiliary (non-CoreML) files that must accompany the mlmodelc bundles.
         public static let vocab = "vocab.json"
@@ -1447,6 +1598,23 @@ public enum ModelNames {
         }
     }
 
+    /// NeuTTS-2E — Qwen3 LM (prefill + MLState decode) + NeuCodec decoder.
+    /// The M=2048 pair covers the full 2048-token context; the repo also
+    /// ships a faster M=1024 pair and a pass-through-KV decode that the
+    /// Swift host does not use.
+    public enum NeuTts {
+        public static let prefillFile = "LM-Prefill-T768-M2048-fp16.mlmodelc"
+        public static let decodeFile = "LM-Decode-M2048-fp16-stateful.mlmodelc"
+        public static let codecFile = "NeuCodec-Decoder-fp16.mlmodelc"
+        public static let tokenizerFile = "tokenizer.json"
+
+        public static let requiredModels: Set<String> = [
+            prefillFile,
+            decodeFile,
+            codecFile,
+        ]
+    }
+
     static func getRequiredModelNames(for repo: Repo, variant: String?) -> Set<String> {
         switch repo {
         case .nemotronMultilingual:
@@ -1475,6 +1643,10 @@ public enum ModelNames {
             return ModelNames.CTC.requiredModels
         case .senseVoiceSmall:
             return ModelNames.SenseVoice.requiredModels(precision: variant)
+        case .campPlus:
+            return ModelNames.CampPlus.requiredModels
+        case .fsmnVad:
+            return ModelNames.FsmnVad.requiredModels
         case .paraformerLargeZh:
             return ModelNames.ParaformerZh.requiredModels
         case .parakeetJa:
@@ -1518,6 +1690,9 @@ public enum ModelNames {
             return ModelNames.MultilingualG2P.requiredModels
         case .cohereTranscribeCoreml:
             return ModelNames.CohereTranscribe.requiredModels
+        case .canary1bV2:
+            return ModelNames.Canary.requiredModels(
+                precision: CanaryPrecision(rawValue: variant ?? "") ?? .int4)
         case .styletts2:
             // Sentinel variants:
             //   "all"     → 14 bundles (8 defaults + 6 buckets)
@@ -1537,9 +1712,13 @@ public enum ModelNames {
             }
         case .supertonic3:
             return ModelNames.Supertonic3.requiredFiles(veVariant: variant)
+        case .neuTts:
+            return ModelNames.NeuTts.requiredModels
         case .luxtts:
             // Variants: "gpu" (macOS) / "ane" (iOS); nil → platform default.
             return ModelNames.LuxTts.requiredFiles(variant: variant)
+        case .inflectMicro, .inflectNano:
+            return ModelNames.Inflect.requiredModels
         }
     }
 }

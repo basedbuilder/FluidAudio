@@ -138,6 +138,97 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
         XCTAssertEqual(removed1, 1, "Should report 1 removed (punctuation)")
     }
 
+    // MARK: - Issue #787: Temporal gating of prefix-collision dedup
+
+    /// Token IDs from issue #787: two different Russian words that share the
+    /// leading subword prefix " тра" + "ран" (= " тран").
+    /// 6841 = " тра" (leading space / word-start marker), 2394 = "ран".
+    private static let sharedPrefixA = 6841  // " тра"
+    private static let sharedPrefixB = 2394  // "ран"
+
+    /// The earlier word (трансформацию) sits in the tail of the accumulated
+    /// history; the later, different word (транскрибируется) opens the new chunk.
+    private var previousWithEarlierWord: [Int] {
+        [10, 11, 12, Self.sharedPrefixA, Self.sharedPrefixB, 9001, 13, 14, 15]
+    }
+    private var currentWithLaterWord: [Int] {
+        [Self.sharedPrefixA, Self.sharedPrefixB, 9002, 20, 21]
+    }
+
+    /// Without timestamps the legacy id-only matcher still strips the shared
+    /// prefix — this documents the #787 bug and pins the fallback behavior.
+    func testDedup_787_NoTimestamps_LegacyStripsSharedPrefix() {
+        let asrManager = AsrManager()
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord,
+            current: currentWithLaterWord
+        )
+        XCTAssertEqual(deduped, [9002, 20, 21], "Legacy id-only path removes the shared prefix")
+        XCTAssertEqual(removed, 2)
+    }
+
+    /// With global timestamps that put the two occurrences ~10s apart, the shared
+    /// prefix must NOT be treated as a duplicate — the later word stays intact.
+    func testDedup_787_FarApartTimestamps_KeepsSharedPrefix() {
+        let asrManager = AsrManager()
+        // 6841@frame 3, 2394@frame 4 in the earlier word.
+        let previousTs = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        // Same token IDs but ~10.4s (130 frames) later — a different utterance.
+        let currentTs = [130, 131, 132, 133, 134]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord,
+            current: currentWithLaterWord,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(
+            deduped, currentWithLaterWord,
+            "Temporally distant prefix collision must not be deduped (#787)")
+        XCTAssertEqual(removed, 0)
+    }
+
+    /// A genuine chunk-boundary duplicate (same acoustic moment, near-identical
+    /// global timestamps) must still be deduped when timestamps are supplied.
+    func testDedup_787_CloseTimestamps_StillDedupes() {
+        let asrManager = AsrManager()
+        let previousTs = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        // Same region re-decoded in the overlapping window: a few frames of jitter.
+        let currentTs = [3, 4, 5, 6, 7]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord,
+            current: currentWithLaterWord,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(deduped, [9002, 20, 21], "Real boundary overlap should still be deduped")
+        XCTAssertEqual(removed, 2)
+    }
+
+    /// A gap just outside `frameTolerance` is rejected; just inside is accepted.
+    func testDedup_787_ToleranceBoundary() {
+        let asrManager = AsrManager()
+        let previousTs = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        let tolerance = ASRConstants.duplicateFrameTolerance
+
+        // prefix at prev frame 3; current just beyond tolerance -> keep
+        let justOutside = [3 + tolerance + 1, 3 + tolerance + 2, 100, 101, 102]
+        let (dedupedOut, removedOut) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord, current: currentWithLaterWord,
+            previousTimestamps: previousTs, currentTimestamps: justOutside)
+        XCTAssertEqual(removedOut, 0, "Gap beyond tolerance is not a duplicate")
+        XCTAssertEqual(dedupedOut, currentWithLaterWord)
+
+        // current just within tolerance -> dedup
+        let justInside = [3 + tolerance, 4 + tolerance, 100, 101, 102]
+        let (dedupedIn, removedIn) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord, current: currentWithLaterWord,
+            previousTimestamps: previousTs, currentTimestamps: justInside)
+        XCTAssertEqual(removedIn, 2, "Gap within tolerance is a duplicate")
+        XCTAssertEqual(dedupedIn, [9002, 20, 21])
+    }
+
     // MARK: - SequenceMatcher Utility Tests
 
     /// Test SequenceMatcher.findSuffixPrefixMatch
@@ -281,5 +372,112 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
                 matcher: exactMatcher
             )
         }
+    }
+
+    // MARK: - Issue #855: last-window overlap re-decode must be stripped
+
+    /// Captured from the issue #855 repro (repetitive speech, final flush window
+    /// re-decoded from frame 0): the previous tail ends "...would go for where we
+    /// would." and the re-decode repeats that run 1-3 frames later before the new
+    /// words (" remove filler words."). The temporally-gated dedup must strip the
+    /// re-decoded overlap (including the partial leading token) and keep the new
+    /// trailing words.
+    func testDedup_855_LastWindowRedecodeStripped() {
+        let asrManager = AsrManager()
+        let previous = [
+            4223, 6882, 317, 910, 3463, 6314, 1316, 7950, 283, 7877, 1974, 4223, 1455, 509, 6843, 750, 4223, 7883,
+        ]
+        let previousTs = [100, 103, 105, 106, 108, 111, 113, 115, 117, 120, 122, 124, 126, 128, 130, 131, 134, 137]
+        // 5831 is a partial word at the window edge; 4223...4223 re-decodes the
+        // previous tail; 4942... are the genuinely new trailing words.
+        let current = [5831, 4223, 1455, 509, 6843, 750, 4223, 4942, 1337, 309, 6312, 4128, 7870, 7883]
+        let currentTs = [122, 125, 127, 130, 133, 135, 137, 139, 141, 144, 146, 150, 152, 154]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previous,
+            current: current,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(
+            deduped, [4942, 1337, 309, 6312, 4128, 7870, 7883],
+            "Re-decoded overlap must be stripped; trailing words must survive")
+        XCTAssertEqual(removed, 7)
+    }
+
+    /// Same trace with the timestamps 10s apart: the identical token runs are then
+    /// genuine repetition, not a seam duplicate, and must be kept (gate holds).
+    func testDedup_855_FarApartRepetitionKept() {
+        let asrManager = AsrManager()
+        let previous = [1974, 4223, 1455, 509, 6843, 750, 4223]
+        let previousTs = [10, 12, 14, 16, 18, 20, 22]
+        let current = [1974, 4223, 1455, 509, 6843, 750, 4223, 4942]
+        let currentTs = [145, 147, 149, 151, 153, 155, 157, 159]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previous,
+            current: current,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(deduped, current, "Repetition ~10s later is not a seam duplicate")
+        XCTAssertEqual(removed, 0)
+    }
+
+    // MARK: - Issue #855: final-window re-decode plan (decoder-entry behavior)
+
+    /// The plan drives the production decoder entry: frame-0 re-decode plus an
+    /// emission cutoff. Removing the production change removes this helper, so
+    /// these tests are coupled to the fix itself, not just to dedup.
+    func testRedecodePlan_LastStreamingChunk() {
+        let plan = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [1, 2, 3],
+            previousTokenTimestamps: [130, 134, 137],
+            globalFrameOffset: 112
+        )
+        XCTAssertEqual(plan.initialTimeIndexOverride, 0, "Final window must re-decode from frame 0")
+        XCTAssertEqual(
+            plan.emitTokensAfterFrame,
+            137 - 112 - AsrManager.redecodeEmissionJitterFrames,
+            "Cutoff = last emitted frame in window-local space minus the jitter margin")
+    }
+
+    func testRedecodePlan_CutoffClampedToZero() {
+        let plan = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [1],
+            previousTokenTimestamps: [3],
+            globalFrameOffset: 112
+        )
+        XCTAssertEqual(plan.initialTimeIndexOverride, 0)
+        XCTAssertEqual(plan.emitTokensAfterFrame, 0, "Cutoff before the window start suppresses nothing")
+    }
+
+    func testRedecodePlan_InactiveOutsideFinalStreamingWindow() {
+        let interior = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: false,
+            previousTokens: [1, 2],
+            previousTokenTimestamps: [10, 20],
+            globalFrameOffset: 0
+        )
+        XCTAssertNil(interior.initialTimeIndexOverride)
+        XCTAssertNil(interior.emitTokensAfterFrame)
+
+        let noTimestamps = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [1, 2],
+            previousTokenTimestamps: nil,
+            globalFrameOffset: 0
+        )
+        XCTAssertNil(noTimestamps.initialTimeIndexOverride, "Batch callers (no timestamps) keep legacy navigation")
+
+        let firstWindow = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [],
+            previousTokenTimestamps: [],
+            globalFrameOffset: 0
+        )
+        XCTAssertNil(firstWindow.initialTimeIndexOverride, "Single-window streams have nothing to re-decode")
     }
 }

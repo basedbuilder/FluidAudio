@@ -688,13 +688,19 @@ struct VBxClustering {
         initialClusters: [Int],
         constraints: SpeakerCountConstraints?
     ) -> VBxOutput {
-        var output = refine(rhoFeatures: rhoFeatures, initialClusters: initialClusters)
+        let output = refine(rhoFeatures: rhoFeatures, initialClusters: initialClusters)
 
         guard let constraints = constraints else {
             return output
         }
 
-        let detectedCount = output.numClusters
+        // Compare against the clusters embeddings actually land in, not the AHC
+        // warm-start count (re-clusters even when VBx already agrees, #801) and
+        // not the pi > epsilon census: a cluster can keep trace mixture weight
+        // while winning no embedding's argmax, so it vanishes from the output.
+        // Gating on the pi census then silently ignores a numSpeakers request
+        // that matches it while the caller sees fewer speakers (#802 review).
+        let detectedCount = output.assignedClusterCount
         guard constraints.needsAdjustment(detectedCount: detectedCount) else {
             return output
         }

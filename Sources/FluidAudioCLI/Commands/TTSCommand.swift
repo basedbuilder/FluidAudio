@@ -62,6 +62,10 @@ public struct TTS {
         // KokoroAne language variant — only consulted when backend == .kokoroAne.
         // Parsed from the `--variant` flag (en/english/zh/mandarin).
         var kokoroAneVariant: KokoroAneVariant = .english
+        // Inflect model size — only consulted when backend == .inflect.
+        // Parsed from `--variant` (micro/nano) or the backend token
+        // (inflect-micro / inflect-nano).
+        var inflectVariant: InflectVariant = .micro
         var lexiconPath: String? = nil
         var text: String? = nil
         // KokoroAne: treat the positional/`--text` value as a pre-computed
@@ -76,6 +80,7 @@ public struct TTS {
         var saveVoicePath: String? = nil
         var pocketLanguage: PocketTtsLanguage = .english
         var pocketPlacement: PocketTtsModelPlacement = .gpu
+        var pocketTemperature: Float = PocketTtsConstants.temperature
         // PocketTTS deterministic-seed mode (uses session API for fixed RNG).
         var pocketSeed: UInt64? = nil
         // StyleTTS2 zero-shot args.
@@ -101,6 +106,8 @@ public struct TTS {
         var luxttsPromptText: String? = nil
         var luxttsSpeed: Float = LuxTtsConstants.defaultSpeed
         var luxttsSeed: UInt64 = LuxTtsConstants.defaultSeed
+        var neuttsSeed: UInt64 = 1234
+        var neuttsEmotion = NeuTtsConstants.defaultEmotion
 
         var i = 0
         while i < arguments.count {
@@ -136,6 +143,10 @@ public struct TTS {
                         kokoroAneVariant = .mandarin
                     case "ja", "japanese", "jp":
                         kokoroAneVariant = .japanese
+                    case "micro", "inflect-micro":
+                        inflectVariant = .micro
+                    case "nano", "inflect-nano":
+                        inflectVariant = .nano
                     default:
                         logger.warning("Unknown variant preference '\(arguments[i + 1])'; ignoring")
                     }
@@ -160,6 +171,16 @@ public struct TTS {
                         backend = .supertonic3
                     case "luxtts", "lux-tts", "lux", "zipvoice":
                         backend = .luxtts
+                    case "neutts", "neutts-2e", "neutts2e":
+                        backend = .neuTts
+                    case "inflect", "inflect-v2":
+                        backend = .inflect
+                    case "inflect-micro":
+                        backend = .inflect
+                        inflectVariant = .micro
+                    case "inflect-nano":
+                        backend = .inflect
+                        inflectVariant = .nano
                     default:
                         logger.warning("Unknown backend '\(arguments[i + 1])'; using kokoro-ane")
                     }
@@ -208,6 +229,11 @@ public struct TTS {
                     luxttsPromptText = arguments[i + 1]
                     i += 1
                 }
+            case "--temperature":
+                if i + 1 < arguments.count, let v = Float(arguments[i + 1]) {
+                    pocketTemperature = v
+                    i += 1
+                }
             case "--silence":
                 if i + 1 < arguments.count, let v = Float(arguments[i + 1]) {
                     supertonicSilence = v
@@ -238,6 +264,12 @@ public struct TTS {
                     styletts2Seed = parsed
                     pocketSeed = parsed
                     luxttsSeed = parsed
+                    neuttsSeed = parsed
+                    i += 1
+                }
+            case "--emotion":
+                if i + 1 < arguments.count {
+                    neuttsEmotion = arguments[i + 1].lowercased()
                     i += 1
                 }
             case "--cpu-only":
@@ -319,7 +351,7 @@ public struct TTS {
                 metricsPath: metricsPath, cloneVoicePath: cloneVoicePath,
                 voiceFilePath: voiceFilePath, saveVoicePath: saveVoicePath,
                 language: pocketLanguage, seed: pocketSeed,
-                placement: pocketPlacement)
+                placement: pocketPlacement, temperature: pocketTemperature)
         case .kokoroAne:
             await runKokoroAne(
                 text: text, output: output, voice: voice, metricsPath: metricsPath,
@@ -350,6 +382,94 @@ public struct TTS {
                 treatAsPhonemes: treatAsPhonemes,
                 speed: luxttsSpeed, seed: luxttsSeed,
                 metricsPath: metricsPath)
+        case .neuTts:
+            await runNeuTts(
+                text: text, output: output, voice: voice,
+                emotion: neuttsEmotion, seed: neuttsSeed,
+                metricsPath: metricsPath)
+        case .inflect:
+            await runInflect(
+                text: text, output: output,
+                variant: inflectVariant, treatAsPhonemes: treatAsPhonemes,
+                seed: pocketSeed ?? 0,
+                metricsPath: metricsPath, cpuOnly: cpuOnly)
+        }
+    }
+
+    /// Run Inflect v2 (Micro / Nano) TTS. With `--phonemes` the positional
+    /// text is treated as an espeak-style IPA string and fed straight to the
+    /// synthesizer (bypassing the Misaki + BART G2P frontend).
+    private static func runInflect(
+        text: String, output: String,
+        variant: InflectVariant, treatAsPhonemes: Bool,
+        seed: UInt64,
+        metricsPath: String?, cpuOnly: Bool
+    ) async {
+        do {
+            let tStart = Date()
+            let computeUnits: MLComputeUnits = cpuOnly ? .cpuOnly : .cpuAndGPU
+            let manager = InflectManager(variant: variant, computeUnits: computeUnits)
+
+            let tLoad0 = Date()
+            try await manager.initialize()
+            let tLoad1 = Date()
+
+            logger.info("Inflect \(variant.rawValue) \(treatAsPhonemes ? "IPA" : "text") synthesis")
+            let tSynth0 = Date()
+            let samples =
+                treatAsPhonemes
+                ? try await manager.synthesize(ipa: text, noiseSeed: seed)
+                : try await manager.synthesize(text: text, noiseSeed: seed)
+            let tSynth1 = Date()
+
+            let outURL = resolveInputURL(output)
+            try FileManager.default.createDirectory(
+                at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let wav = try AudioWAV.data(
+                from: samples, sampleRate: Double(InflectConstants.sampleRate))
+            try wav.write(to: outURL)
+
+            let loadS = tLoad1.timeIntervalSince(tLoad0)
+            let synthS = tSynth1.timeIntervalSince(tSynth0)
+            let totalS = tSynth1.timeIntervalSince(tStart)
+            let audioSecs = Double(samples.count) / Double(InflectConstants.sampleRate)
+            let rtfx = synthS > 0 ? audioSecs / synthS : 0
+
+            logger.info("Inflect synthesis complete")
+            logger.info("  Load: \(String(format: "%.3f", loadS))s")
+            logger.info("  Synthesis: \(String(format: "%.3f", synthS))s")
+            logger.info("  Audio: \(String(format: "%.3f", audioSecs))s")
+            logger.info("  RTFx: \(String(format: "%.2f", rtfx))x")
+            logger.info("  Total: \(String(format: "%.3f", totalS))s")
+            logger.info("  Output: \(outURL.path)")
+
+            if let metricsPath {
+                let metricsDict: [String: Any] = [
+                    "backend": "inflect-\(variant.rawValue)",
+                    "text": text,
+                    "phonemes_mode": treatAsPhonemes,
+                    "seed": seed,
+                    "output": outURL.path,
+                    "model_load_time_s": loadS,
+                    "inference_time_s": synthS,
+                    "audio_duration_s": audioSecs,
+                    "realtime_speed": rtfx,
+                    "total_time_s": totalS,
+                ]
+                let artifactsRoot = try ensureArtifactsRoot()
+                let mURL = resolveOutputURL(
+                    metricsPath, artifactsRoot: artifactsRoot, expectsDirectory: false)
+                try FileManager.default.createDirectory(
+                    at: mURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let json = try JSONSerialization.data(
+                    withJSONObject: metricsDict, options: [.prettyPrinted])
+                try json.write(to: mURL)
+                logger.info("Metrics saved: \(mURL.path)")
+            }
+        } catch {
+            logger.error("Inflect Error: \(error)")
+            print("Inflect failed: \(error)")
+            exit(1)
         }
     }
 
@@ -524,11 +644,13 @@ public struct TTS {
         voice: String,
         voiceData: PocketTtsVoiceData?,
         seed: UInt64,
-        deEss: Bool
+        deEss: Bool,
+        temperature: Float
     ) async throws -> Data {
         logger.info("PocketTTS deterministic mode: seed=\(seed)")
         let session = try await makePocketSeededSession(
-            manager: manager, voice: voice, voiceData: voiceData, seed: seed)
+            manager: manager, voice: voice, voiceData: voiceData, seed: seed,
+            temperature: temperature)
         session.enqueue(text)
         session.finish()
         var allSamples: [Float] = []
@@ -554,17 +676,18 @@ public struct TTS {
         manager: PocketTtsManager,
         voice: String,
         voiceData: PocketTtsVoiceData?,
-        seed: UInt64
+        seed: UInt64,
+        temperature: Float
     ) async throws -> PocketTtsSession {
         if let voiceData = voiceData {
             return try await manager.makeSession(
                 voiceData: voiceData,
-                temperature: PocketTtsConstants.temperature,
+                temperature: temperature,
                 seed: seed)
         }
         return try await manager.makeSession(
             voice: voice,
-            temperature: PocketTtsConstants.temperature,
+            temperature: temperature,
             seed: seed)
     }
 
@@ -574,7 +697,8 @@ public struct TTS {
         voiceFilePath: String?, saveVoicePath: String?,
         language: PocketTtsLanguage,
         seed: UInt64? = nil,
-        placement: PocketTtsModelPlacement = .gpu
+        placement: PocketTtsModelPlacement = .gpu,
+        temperature: Float = PocketTtsConstants.temperature
     ) async {
         do {
             let tStart = Date()
@@ -620,13 +744,14 @@ public struct TTS {
                     voice: pocketVoice,
                     voiceData: voiceData,
                     seed: seed,
-                    deEss: deEss)
+                    deEss: deEss,
+                    temperature: temperature)
             } else if let voiceData = voiceData {
                 wav = try await manager.synthesize(
-                    text: text, voiceData: voiceData, deEss: deEss)
+                    text: text, voiceData: voiceData, temperature: temperature, deEss: deEss)
             } else {
                 wav = try await manager.synthesize(
-                    text: text, voice: pocketVoice, deEss: deEss)
+                    text: text, voice: pocketVoice, temperature: temperature, deEss: deEss)
             }
             let tSynth1 = Date()
 
@@ -765,10 +890,12 @@ public struct TTS {
                 detailed = try await manager.synthesizeDetailed(
                     text: text, voice: resolvedVoice, speed: 1.0)
             }
+            // Native level for all variants — matches the PyTorch reference
+            // now that KokoroTail_v2 carries the COLA-corrected iSTFT (#852).
             let wav = try AudioWAV.data(
                 from: detailed.samples,
                 sampleRate: Double(detailed.sampleRate),
-                normalize: variant != .japanese)
+                normalize: false)
             let tSynth1 = Date()
 
             let outURL = resolveInputURL(output)
@@ -1103,6 +1230,97 @@ public struct TTS {
         }
     }
 
+    /// Run NeuTTS-2E emotional synthesis. `--voice` selects one of the four
+    /// fixed speakers (emily/paul/sophie/steven); `--emotion` one of the
+    /// seven emotions. Requires macOS 15+ (MLState KV cache).
+    private static func runNeuTts(
+        text: String, output: String, voice: String,
+        emotion: String, seed: UInt64,
+        metricsPath: String?
+    ) async {
+        guard #available(macOS 15.0, *) else {
+            logger.error("NeuTTS-2E requires macOS 15+ (MLState KV cache)")
+            exit(1)
+        }
+        do {
+            let tStart = Date()
+            let speaker: String
+            if NeuTtsConstants.speakers.contains(voice) {
+                speaker = voice
+            } else {
+                if voice != TtsConstants.recommendedVoice {
+                    logger.warning(
+                        "Unknown NeuTTS speaker '\(voice)'; using "
+                            + "\(NeuTtsConstants.defaultSpeaker). Valid speakers: "
+                            + NeuTtsConstants.speakers.joined(separator: ", ") + ".")
+                }
+                speaker = NeuTtsConstants.defaultSpeaker
+            }
+
+            let manager = NeuTtsManager()
+            let tLoad0 = Date()
+            try await manager.initialize()
+            let tLoad1 = Date()
+            logger.info("NeuTTS-2E speaker=\(speaker) emotion=\(emotion) seed=\(seed)")
+
+            let tSynth0 = Date()
+            let audio = try await manager.synthesize(
+                text: text, speaker: speaker, emotion: emotion, seed: seed)
+            let tSynth1 = Date()
+
+            let outURL = resolveInputURL(output)
+            try FileManager.default.createDirectory(
+                at: outURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            let wav = try AudioWAV.data(
+                from: audio.samples, sampleRate: Double(audio.sampleRate))
+            try wav.write(to: outURL)
+
+            let loadS = tLoad1.timeIntervalSince(tLoad0)
+            let synthS = tSynth1.timeIntervalSince(tSynth0)
+            let totalS = tSynth1.timeIntervalSince(tStart)
+            let audioSecs = Double(audio.samples.count) / Double(audio.sampleRate)
+            let rtfx = synthS > 0 ? audioSecs / synthS : 0
+
+            logger.info("NeuTTS-2E synthesis complete")
+            logger.info("  Load: \(String(format: "%.3f", loadS))s")
+            logger.info("  Synthesis: \(String(format: "%.3f", synthS))s")
+            logger.info("  Audio: \(String(format: "%.3f", audioSecs))s")
+            logger.info("  RTFx: \(String(format: "%.2f", rtfx))x")
+            logger.info("  Output: \(outURL.path)")
+
+            if let metricsPath {
+                let metricsDict: [String: Any] = [
+                    "backend": "neutts",
+                    "text": text,
+                    "speaker": speaker,
+                    "emotion": emotion,
+                    "seed": seed,
+                    "output": outURL.path,
+                    "model_load_time_s": loadS,
+                    "inference_time_s": synthS,
+                    "audio_duration_s": audioSecs,
+                    "realtime_speed": rtfx,
+                    "total_time_s": totalS,
+                ]
+                let artifactsRoot = try ensureArtifactsRoot()
+                let mURL = resolveOutputURL(
+                    metricsPath, artifactsRoot: artifactsRoot, expectsDirectory: false)
+                try FileManager.default.createDirectory(
+                    at: mURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true)
+                let json = try JSONSerialization.data(
+                    withJSONObject: metricsDict, options: [.prettyPrinted])
+                try json.write(to: mURL)
+                logger.info("Metrics saved: \(mURL.path)")
+            }
+        } catch {
+            logger.error("NeuTTS-2E Error: \(error)")
+            print("NeuTTS-2E failed: \(error)")
+            exit(1)
+        }
+    }
+
     private static func printUsage() {
         print(
             """
@@ -1111,7 +1329,8 @@ public struct TTS {
             Options:
               --output, -o         Output WAV path (default: output.wav)
               --voice, -v          Voice name (default: af_heart for KokoroAne, alba for PocketTTS)
-              --backend            TTS backend: kokoro-ane (default), pocket, styletts2, supertonic3, luxtts
+              --backend            TTS backend: kokoro-ane (default), pocket, styletts2,
+                                   supertonic3, luxtts, neutts (beta), inflect (beta)
                                    StyleTTS2 (zero-shot, English):
                                      --reference <speaker.wav>  required
                                      --alpha 0.3                ref-side blend (default 0.3)
@@ -1165,6 +1384,7 @@ public struct TTS {
                                    portuguese, portuguese_24l, spanish, spanish_24l
                                    Note: French is 24-layer only (no 6-layer pack upstream)
               --seed N             Deterministic-mode seed (uses session API for fixed RNG)
+              --temperature T      Generation temperature (default 0.7)
               --placement P        Model placement: gpu (default), ane (rank-4 ANE models),
                                    ane-state (Trial 23 MLState multifunction pipeline;
                                    macOS 15+/iOS 18+, requires pocket_state.mlmodelc)

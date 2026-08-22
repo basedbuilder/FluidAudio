@@ -229,6 +229,39 @@ MiniMax-English 100-phrase suite — including the longer paragraph
 phrases that pull the per-corpus aggregate down to ~5.2× — see
 [Benchmarks.md](Benchmarks.md).
 
+## Known OS issues
+
+The following OS/runtime constraints affect the 7-stage chain:
+
+- **OS 27 background inference:** iOS and iPadOS 27 require the host app to
+  include the
+  [`com.apple.developer.background-tasks.continued-processing.inference`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.background-tasks.continued-processing.inference)
+  entitlement before Core ML can use the Neural Engine while the app is in the
+  background. A Swift package cannot add application entitlements; enable it
+  on the consuming app target. Foreground inference does not require it.
+- **Legacy Kokoro ANE caches on OS 27:** older compiled bundles without MIL
+  `FlexibleShapeInformation` can return invalid dynamic-shape output (including
+  NaN durations) under the E5 runtime (#738). FluidAudio now detects those
+  bundles during initialization and transactionally replaces only the affected
+  cache entries. No manual cache deletion is required; a failed download rolls
+  back to the previous bundle.
+- The two execution bugs below are handled by OS updates or FluidAudio's
+  default per-stage compute routing.
+
+| Bug | Signature | Affected OS | Status |
+|-----|-----------|-------------|--------|
+| BNNS CPU segfault | `EXC_BAD_ACCESS` in `libBNNS.dylib` (`BNNSGraphContextExecute_v2` → `BnnsCpuInferenceOperation::ExecuteSync`, queue `com.apple.e5rt.concurrentExecutionQueue`) | iOS/macOS **26.4 – 26.5.x** | **Fixed in the 26.6 line.** Verified on M5/macOS 26.6: the #667 repro (repeated synthesis) passes under `cpuOnly` and `allAne`, both of which segfaulted every time on 26.5. |
+| GPU RNN JIT assert | `GPURNNOps.mm: failed assertion 'JIT not supported'` (SIGABRT) | macOS 26.5+, incl. **26.6** (M5-class) | **Still live.** Avoided by the default routing (#671/#677), which keeps RNN-bearing stages off the GPU. Do not route Prosody/Vocoder to `.cpuAndGPU`. |
+
+The BNNS segfault cannot be avoided by compute-unit routing — CoreML places
+segments on the BNNS CPU path even under `.cpuOnly` (#587), and on affected
+OS builds the same binary can flip between all-pass and all-crash across a
+day (#817). `KokoroAneManager.initialize()` logs a warning on affected OS
+builds. The only reliable remedy is updating to the 26.6 OS line.
+
+History: #328 (26.4 beta), #587 (iOS 26.4.2), #661 (cross-manager E5RT),
+#667 (M5/macOS 26.5), #817 (time/environment-gated evidence).
+
 ## Source
 
 - HuggingFace (English): [`FluidInference/kokoro-82m-coreml/ANE/`](https://huggingface.co/FluidInference/kokoro-82m-coreml/tree/main/ANE)
