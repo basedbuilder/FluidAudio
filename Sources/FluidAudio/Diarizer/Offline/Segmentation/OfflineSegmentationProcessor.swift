@@ -187,7 +187,11 @@ struct OfflineSegmentationProcessor {
         }
 
         var processedAnyBatch = false
-        var offsetIterator = stride(from: 0, to: totalSamples, by: stepSize).makeIterator()
+        // The component model follows the source model's full windows plus one
+        // partial tail. Repeated mostly padded tails overweight the last voice.
+        let offsetLimit = config.useSpeechComponentEmbeddings
+            ? max(1, totalSamples - chunkSize + stepSize) : totalSamples
+        var offsetIterator = stride(from: 0, to: offsetLimit, by: stepSize).makeIterator()
         var batchOffsets: [Int] = []
         batchOffsets.reserveCapacity(batchCapacity)
 
@@ -283,7 +287,8 @@ struct OfflineSegmentationProcessor {
                 )
             }
 
-            frameDuration = config.windowDuration / Double(frames)
+            frameDuration = config.useSpeechComponentEmbeddings
+                ? 270.0 / 16_000.0 : config.windowDuration / Double(frames)
             numFrames = frames
 
             if classes > powerset.count {

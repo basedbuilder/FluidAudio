@@ -20,7 +20,15 @@ public struct PreparedDiarization: Sendable {
 
     let prepareWallSeconds: TimeInterval
 
+    var componentTraining: SpeechComponentTraining? = nil
+
     public var embeddingCount: Int { timedEmbeddings.count }
 
     public var segmentationChunkCount: Int { segmentation.numChunks }
+}
+
+struct SpeechComponentTraining: Sendable {
+    let indices: [Int]
+    let cleanIntervals: [[Range<Int>]]
+    let minimumSharedSamples: Int
 }

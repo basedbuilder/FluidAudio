@@ -176,6 +176,13 @@ public final class OfflineDiarizerManager {
             throw OfflineDiarizationError.modelNotLoaded("offline-diarizer")
         }
 
+        if config.useSpeechComponentEmbeddings {
+            return try await OfflineSpeechComponentExtractor.prepare(
+                audioSource: audioSource, audioLoadingSeconds: audioLoadingSeconds,
+                models: models, config: config, progressCallback: progressCallback
+            )
+        }
+
         let prepareStart = Date()
         let totalChunks = max(
             1, (audioSource.sampleCount + config.samplesPerStep - 1) / config.samplesPerStep)
@@ -287,9 +294,8 @@ public final class OfflineDiarizerManager {
         let rhoFeatures = timedEmbeddings.map { $0.rho128 }
 
         let clusteringStart = Date()
-        let trainingIndices = selectTrainingEmbeddings(
-            timedEmbeddings: timedEmbeddings
-        )
+        let trainingIndices = prepared.componentTraining?.indices
+            ?? selectTrainingEmbeddings(timedEmbeddings: timedEmbeddings)
 
         let trainingEmbeddings = trainingIndices.map { embeddingFeatures[$0] }
         let trainingRho = trainingIndices.map { rhoFeatures[$0] }
@@ -348,6 +354,22 @@ public final class OfflineDiarizerManager {
             initialClusters: initialClusters
         )
         var centroids = centroidComputation.centroids
+        if let componentTraining = prepared.componentTraining,
+            !centroids.isEmpty, !vbxOutput.wasAdjusted,
+            !config.clustering.preserveAutomaticAHCClusters,
+            config.clustering.numSpeakers == nil,
+            config.clustering.minSpeakers == nil,
+            config.clustering.maxSpeakers == nil
+        {
+            centroids = try OfflineSpeakerMergeSupport.refine(
+                centroids: centroids,
+                retainedColumns: centroidComputation.mapping.sorted { $0.value < $1.value }.map(\.key),
+                gamma: vbxOutput.gamma, initialClusters: initialClusters,
+                trainingEmbeddings: trainingEmbeddings,
+                cleanIntervals: componentTraining.cleanIntervals,
+                minimumSharedSamples: componentTraining.minimumSharedSamples
+            )
+        }
         if centroids.isEmpty {
             centroids = computeFallbackCentroids(from: embeddingFeatures)
         }
@@ -780,7 +802,7 @@ public final class OfflineDiarizerManager {
         return [accumulator]
     }
 
-    private func assignEmbeddings(
+    func assignEmbeddings(
         embeddingFeatures: [[Double]],
         centroids: [[Double]]
     ) -> [Int] {
@@ -866,7 +888,7 @@ public final class OfflineDiarizerManager {
         return result
     }
 
-    private func buildChunkAssignments(
+    func buildChunkAssignments(
         segmentation: SegmentationOutput,
         timedEmbeddings: [TimedEmbedding],
         assignments: [Int],

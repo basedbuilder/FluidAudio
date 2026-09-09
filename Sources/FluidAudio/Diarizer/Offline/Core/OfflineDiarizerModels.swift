@@ -7,6 +7,7 @@ public struct OfflineDiarizerModels: Sendable {
     public let segmentationModel: MLModel
     public let fbankModel: MLModel
     public let embeddingModel: MLModel
+    public let speechComponentEmbeddingModel: MLModel?
     public let pldaRhoModel: MLModel
     public let pldaPsi: [Double]
 
@@ -57,11 +58,13 @@ public struct OfflineDiarizerModels: Sendable {
         embeddingModel: MLModel,
         pldaRhoModel: MLModel,
         pldaPsi: [Double],
-        compilationDuration: TimeInterval
+        compilationDuration: TimeInterval,
+        speechComponentEmbeddingModel: MLModel? = nil
     ) {
         self.segmentationModel = segmentationModel
         self.fbankModel = fbankModel
         self.embeddingModel = embeddingModel
+        self.speechComponentEmbeddingModel = speechComponentEmbeddingModel
         self.pldaRhoModel = pldaRhoModel
         self.pldaPsi = pldaPsi
         self.compilationDuration = compilationDuration

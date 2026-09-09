@@ -293,6 +293,46 @@ final class ChunkEmbeddingExposureTests: XCTestCase {
 @available(macOS 13.0, iOS 16.0, *)
 final class SpeakerActivityExposureTests: XCTestCase {
 
+    func testShortRecognizedTurnDoesNotInheritEmbeddingDurationFloor() {
+        let output = shortTurnOutput(embeddingMinimum: 1.0, activityMinimum: 0.0)
+        XCTAssertEqual(segmentShapes(output.speakerActivitySegments), ["S1|0.0|2.0", "S2|1.5|2.5", "S3|3.0|3.5"])
+        XCTAssertEqual(segmentShapes(output.segments), ["S1|0.0|2.0", "S2|2.0|2.5", "S3|3.0|3.5"])
+    }
+
+    func testEmbeddingMaskDurationCannotDeleteAlreadyAssignedActivity() {
+        let output = shortTurnOutput(embeddingMinimum: 10.0, activityMinimum: 0.0)
+        XCTAssertEqual(segmentShapes(output.speakerActivitySegments), ["S1|0.0|2.0", "S2|1.5|2.5", "S3|3.0|3.5"])
+        XCTAssertEqual(segmentShapes(output.segments), ["S1|0.0|2.0", "S2|2.0|2.5", "S3|3.0|3.5"])
+    }
+
+    func testExplicitActivityDurationStillFiltersShortOutput() {
+        let output = shortTurnOutput(embeddingMinimum: 1.0, activityMinimum: 0.6)
+        XCTAssertEqual(segmentShapes(output.speakerActivitySegments), ["S1|0.0|2.0", "S2|1.5|2.5"])
+        XCTAssertEqual(segmentShapes(output.segments), ["S1|0.0|2.0"])
+    }
+
+    private func shortTurnOutput(embeddingMinimum: Double, activityMinimum: Double) -> OfflineReconstruction.SegmentOutputs {
+        var config = OfflineDiarizerConfig(
+            minSegmentDuration: embeddingMinimum,
+            minGapDuration: 0.1,
+            segmentationMinDurationOn: activityMinimum,
+            segmentationMinDurationOff: 0.0
+        )
+        config.useSpeechComponentEmbeddings = true
+        // Exercise the activity-to-turn boundary directly. No audio or model is fabricated.
+        let weights: [[Float]] = (0..<35).map { frame in
+            [frame < 20 ? 1 : 0, (15..<25).contains(frame) ? 1 : 0, frame >= 30 ? 1 : 0]
+        }
+        let segmentation = SegmentationOutput(
+            logProbs: [], speakerWeights: [weights], numChunks: 1, numFrames: 35,
+            numSpeakers: 3, chunkOffsets: [0], frameDuration: 0.1
+        )
+        return OfflineReconstruction(config: config).buildSegmentOutputs(
+            segmentation: segmentation, hardClusters: [[0, 1, 2]],
+            centroids: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        )
+    }
+
     func testOverlapRetainsSpeakerActivityWhileLegacySegmentsStayExclusive() {
         var config = OfflineDiarizerConfig(
             minSegmentDuration: 0.1,

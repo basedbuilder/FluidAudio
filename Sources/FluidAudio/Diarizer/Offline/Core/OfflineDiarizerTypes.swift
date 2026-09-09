@@ -32,6 +32,10 @@ public enum OfflineDiarizationError: Error, LocalizedError {
 /// to minimize downstream churn.
 public struct OfflineDiarizerConfig: Sendable {
 
+    /// Use real speech components with the matching unpadded embedding model.
+    /// Opt-in so existing callers retain their model and timeline contract.
+    public var useSpeechComponentEmbeddings = false
+
     /// Segmentation parameters. Threshold fields are ignored by powerset models like community-1 but
     /// remain for compatibility with non-powerset pipelines.
     public struct Segmentation: Sendable {
