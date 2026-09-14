@@ -1,4 +1,5 @@
 @preconcurrency import CoreML
+import Accelerate
 import Foundation
 
 /// Manager for SenseVoiceSmall transcription.
@@ -111,35 +112,16 @@ public actor SenseVoiceManager {
     /// Greedy CTC over the first `validFrames` (drop blank 0, collapse repeats),
     /// detokenize, then strip the `<|...|>` meta tags.
     private func decode(logits: MLMultiArray, validFrames: Int) -> String {
-        let vocab = logits.shape[2].intValue
         let frames = min(validFrames, logits.shape[1].intValue)
+        // Per-frame argmax via the shared vDSP helper (~0.5s -> sub-ms for the
+        // frames×vocab ~6.4M element scan), then CTC collapse (drop blank 0,
+        // collapse repeats).
         var ids: [Int] = []
+        ids.reserveCapacity(frames)
         var prev = -1
-
-        func appendArgmax(frameBase: (Int) -> Float) {
-            var best = 0
-            var bestVal = frameBase(0)
-            for v in 1..<vocab {
-                let x = frameBase(v)
-                if x > bestVal {
-                    bestVal = x
-                    best = v
-                }
-            }
+        for best in LogitsArgmax.argmaxPerFrame(logits: logits, frames: frames) {
             if best != SenseVoiceConfig.blankId && best != prev { ids.append(best) }
             prev = best
-        }
-
-        if logits.dataType == .float32 {
-            let p = logits.dataPointer.assumingMemoryBound(to: Float32.self)
-            for t in 0..<frames {
-                let base = t * vocab
-                appendArgmax { p[base + $0] }
-            }
-        } else {
-            for t in 0..<frames {
-                appendArgmax { logits[[0, t as NSNumber, $0 as NSNumber]].floatValue }
-            }
         }
 
         let raw = decodeCtcTokenIds(ids, vocabulary: models.vocabulary)

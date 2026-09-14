@@ -66,6 +66,9 @@ public actor KokoroAneManager {
     /// Download (if missing), load all 7 mlmodelcs + vocab + default voice
     /// pack. Optionally pre-warm additional voice packs.
     public func initialize(preloadVoices: Set<String>? = nil) async throws {
+        if let advisory = Self.osAdvisory(for: ProcessInfo.processInfo.operatingSystemVersion) {
+            logger.warning(advisory)
+        }
         try await store.loadIfNeeded()
         // English G2P CoreML assets live in the kokoro repo and are loaded
         // from ~/.cache/fluidaudio/Models/kokoro/. The Mandarin variant
@@ -98,6 +101,52 @@ public actor KokoroAneManager {
                 _ = try await store.voicePack(voice)
             }
         }
+    }
+
+    #if os(macOS)
+    private static let runningOnMacOS = true
+    #else
+    private static let runningOnMacOS = false
+    #endif
+
+    /// The 26.4+ OS line carries an Apple BNNS bug that can intermittently
+    /// crash synthesis in libBNNS on any compute-unit routing
+    /// (#328/#587/#667/#817). macOS 26.6 fixes it (verified, #817); iOS 26.6
+    /// still crashes with the identical signature (#844), and iOS 27.0 crashes
+    /// in libBNNS (`vadd_fp16_sme_internal`) on the Metal-free route that is
+    /// the 27 default, while the Metal route aborts in MPSGraph (#843, #889).
+    /// So on non-macOS everything from 26.4 on stays flagged until a build is
+    /// shown to be safe. macOS 27 has no report and is not flagged.
+    static func isBnnsCrashProneOS(
+        _ version: OperatingSystemVersion, onMacOS: Bool = runningOnMacOS
+    ) -> Bool {
+        if version.majorVersion >= 27 { return !onMacOS }
+        guard version.majorVersion == 26, version.minorVersion >= 4 else { return false }
+        return onMacOS ? version.minorVersion <= 5 : true
+    }
+
+    /// The warning `initialize()` logs on a crash-prone OS build, or nil.
+    /// Route-aware: on the iOS 27 line neither Core ML route is known to be
+    /// safe (#889), which is a different message from the 26.x BNNS bug.
+    static func osAdvisory(
+        for version: OperatingSystemVersion, onMacOS: Bool = runningOnMacOS
+    ) -> String? {
+        guard isBnnsCrashProneOS(version, onMacOS: onMacOS) else { return nil }
+        if version.majorVersion >= 27 {
+            return
+                "iOS/iPadOS 27: no Core ML route for Kokoro ANE is known to be safe. "
+                + "The default Metal-free route (noise + tail on CPU) has crashed in libBNNS "
+                + "(vadd_fp16_sme_internal SIGSEGV) after ~1 h of synthesis, and the Metal "
+                + "route aborts in MPSGraph within minutes. Both are uncatchable in-process. "
+                + "Consider disabling Kokoro ANE on this OS line until a safe route is shown. "
+                + "See https://github.com/FluidInference/FluidAudio/issues/889"
+        }
+        return
+            "This OS build has a known Apple BNNS bug that can "
+            + "intermittently crash Kokoro synthesis (EXC_BAD_ACCESS in libBNNS) "
+            + "regardless of compute-unit routing. macOS 26.6 fixes it; on iOS "
+            + "the 26.6 line still crashes. "
+            + "See https://github.com/FluidInference/FluidAudio/issues/844"
     }
 
     /// `true` once the 7 mlmodelcs + vocab are resident.
@@ -201,7 +250,14 @@ public actor KokoroAneManager {
             // Normalize written forms to their Mandarin reading before
             // segmentation — e.g. "$5" → "五美元", "2024年" → "二零二四年" —
             // so the numeric/semiotic tokens reach MandarinG2P as Hanzi.
-            let normalized = NemoTextNormalizer.normalize(text, language: .mandarin)
+            var normalized = NemoTextNormalizer.normalize(text, language: .mandarin)
+            // Without the engine linked (`NemoTextProcessing` trait off), a
+            // numeric-only input ("$5.50", "99%") has no Hanzi and would fall
+            // into the bopomofo passthrough below, reading digits as tones.
+            // MandarinNumberNormalizer covers those forms so the gate sees Hanzi.
+            if !NemoTextNormalizer.isAvailable, !MandarinG2P.looksLikeHanzi(normalized) {
+                normalized = MandarinNumberNormalizer.normalize(normalized)
+            }
             if MandarinG2P.looksLikeHanzi(normalized) {
                 let g2p = try await store.mandarinG2PPipeline()
                 return try await g2p.phonemize(normalized)
@@ -332,14 +388,14 @@ public actor KokoroAneManager {
 
     private func wavData(from result: KokoroAneSynthesisResult) throws -> Data {
         do {
-            // Japanese writes at the model's native level (no peak-normalization)
-            // so the output matches the PyTorch reference instead of being
-            // slammed to 0 dBFS. English/Mandarin keep peak-normalization until
-            // their tails get the same COLA-corrected iSTFT (#698 follow-up).
+            // All variants write at the model's native level (no
+            // peak-normalization) so the output matches the PyTorch reference
+            // instead of being slammed to 0 dBFS. Requires the COLA-corrected
+            // KokoroTail_v2 (#852).
             return try AudioWAV.data(
                 from: result.samples,
                 sampleRate: Double(result.sampleRate),
-                normalize: variant != .japanese)
+                normalize: false)
         } catch {
             throw KokoroAneError.audioConversionFailed(error.localizedDescription)
         }

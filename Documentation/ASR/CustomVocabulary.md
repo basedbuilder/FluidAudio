@@ -320,8 +320,15 @@ for candidate in output.candidates {
 
 The candidate API runs the same discovery, guards, and CTC comparison as legacy rescoring, but it
 returns every comparison evaluation without rewriting `baseText`. Each candidate identifies the
-canonical term, the exact alias that produced the best string match (or `nil` for the canonical
-form), string similarity, raw CTC scores before context biasing, and the effective boost.
+canonical term, the configured alias that produced the best string-similarity score (or `nil` when
+the canonical form produced it), string similarity, raw CTC scores before context biasing, and the
+effective boost. `matchedAlias` identifies the winning configured form even when the match was
+fuzzy; its presence does not prove that the alias was spoken exactly. Consumers that need to
+distinguish exact from fuzzy scorer results can use `similarity == 1.0`. That score reflects the
+discovery path's normalized scorer input: compound matching may concatenate adjacent words, and
+normalization may ignore case or punctuation. It therefore does not assert raw-text equality or
+determine whether applying the vocabulary replacement is semantically safe. Clients implementing
+custom arbitration must make that policy decision themselves.
 
 `comparisonPassed` reports only the numeric, pre-arbitration comparison: boosted vocabulary score
 greater than original score. `legacyOutcome` reports what the compatibility `ctcTokenRescore()`
@@ -377,7 +384,9 @@ let vocabulary = CustomVocabularyContext(terms: [
 ])
 ```
 
-Each term is tokenized and scored against CTC log-probabilities. High-scoring terms are used to correct the TDT transcript.
+Terms without `ctcTokenIds` are tokenized with the CTC tokenizer when boosting is configured (`configureVocabularyBoosting` on any engine, or `VocabularyBoostingSession.init`), so the plain `CustomVocabularyTerm(text:)` form above works as written. Pre-tokenized terms (from `loadWithCtcTokens(from:)`, or an explicit `ctcTokenIds:`) are used as-is; a term that encodes to nothing is dropped with a warning. Each term is then scored against CTC log-probabilities, and high-scoring terms correct the transcript. (Before #851 this path was a silent no-op: untokenized terms were skipped without any log.)
+
+**Streaming (`SlidingWindowAsrManager`).** Every window is rescored, including windows that are still volatile (a clip shorter than `minContextForConfirmation`, a low-confidence window, the final flush) — confirmation only governs display promotion, and a window's text is promoted verbatim later.
 
 #### Alias Support
 

@@ -156,11 +156,21 @@ is a flat `[510, 256]` fp32 matrix. Row index = `min(max(phonemeCount - 1,
 + Prosody).
 
 The English bundle stores voice packs flat at the bundle root
-(`<voice>.bin`); the Mandarin bundle nests them under `voices/<voice>.bin`.
-This single-voice-per-variant constraint is intrinsic to the upstream
-conversion — adding voices requires re-converting `KokoroPostAlbert` /
-`KokoroProsody` / `KokoroNoise` / `KokoroVocoder` against the new style
-embeddings.
+(`<voice>.bin`); the Mandarin and Japanese bundles nest them under
+`voices/<voice>.bin`.
+
+**Any Kokoro-82M v1.0 voice works with the English chain.** The four style
+consumers take `style_s` / `style_timbre` as runtime inputs — nothing is baked
+into the converted models — so a voice is just another `[510, 256]` pack. The
+English bundle publishes only `af_heart.bin` pre-converted; for any other name
+`KokoroAneResourceDownloader.ensureVoicePack` fetches the repo-root
+`voices/<name>.json` (the upstream v1.0 set, 54 voices, see
+`KokoroAneConstants.englishVoices`) and converts it on first use — row `k` of
+the flat pack is JSON key `"k+1"`, verified byte-exact against `af_heart.bin`
+(#896). Pick with `KokoroAneManager(defaultVoice:)` or `synthesize(text:voice:)`;
+an unknown name throws `KokoroAneError.voiceNotFound` listing the catalog.
+The Mandarin bundle ships 103 voices and the Japanese bundle 5, all
+pre-converted (`KokoroAneConstants.mandarinVoices` / `japaneseVoices`).
 
 ## Mandarin G2P
 
@@ -200,7 +210,7 @@ viable upgrades — the current pipeline trades them for a zero-network
 - **Phonemes:** ≤ 510 IPA / Bopomofo chars per call (ALBERT context = 512
   incl. BOS/EOS). No built-in chunker — split upstream if you need longer
   inputs.
-- **Voices:** `af_heart` only (English) / `zf_001` only (Mandarin).
+- **Voices:** any pack in the variant's catalog (`KokoroAneVariant.knownVoices`): 54 English (converted on first use), 103 Mandarin, 5 Japanese. See "Voice packs" above.
 - **Custom lexicon / SSML / Markdown overrides:** not supported. The pipeline
   goes `text → G2P → phonemes → token ids` with no interception point.
 - **Acoustic frames:** `T_a ≤ 2000` (compile-time `--max-frames` baked into
@@ -228,6 +238,47 @@ full-corpus numbers (warm-synth p50 / p95, peak RSS, WER) on the
 MiniMax-English 100-phrase suite — including the longer paragraph
 phrases that pull the per-corpus aggregate down to ~5.2× — see
 [Benchmarks.md](Benchmarks.md).
+
+## Known OS issues
+
+The following OS/runtime constraints affect the 7-stage chain:
+
+- **OS 27 background inference:** iOS and iPadOS 27 require the host app to
+  include the
+  [`com.apple.developer.background-tasks.continued-processing.inference`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.background-tasks.continued-processing.inference)
+  entitlement before Core ML can use the Neural Engine while the app is in the
+  background. A Swift package cannot add application entitlements; enable it
+  on the consuming app target. Foreground inference does not require it.
+- **Legacy Kokoro ANE caches on OS 27:** older compiled bundles without MIL
+  `FlexibleShapeInformation` can return invalid dynamic-shape output (including
+  NaN durations) under the E5 runtime (#738). FluidAudio now detects those
+  bundles during initialization and transactionally replaces only the affected
+  cache entries. No manual cache deletion is required; a failed download rolls
+  back to the previous bundle.
+- The two execution bugs below are handled by OS updates or FluidAudio's
+  default per-stage compute routing.
+
+| Bug | Signature | Affected OS | Status |
+|-----|-----------|-------------|--------|
+| BNNS CPU segfault | `EXC_BAD_ACCESS` in `libBNNS.dylib` (`BNNSGraphContextExecute_v2` → `BnnsCpuInferenceOperation::ExecuteSync`, queue `com.apple.e5rt.concurrentExecutionQueue`) | iOS/macOS **26.4 – 26.5.x** | **Fixed in the 26.6 line.** Verified on M5/macOS 26.6: the #667 repro (repeated synthesis) passes under `cpuOnly` and `allAne`, both of which segfaulted every time on 26.5. |
+| GPU RNN JIT assert | `GPURNNOps.mm: failed assertion 'JIT not supported'` (SIGABRT) | macOS 26.5+, incl. **26.6** (M5-class) | **Still live.** Avoided by the default routing (#671/#677), which keeps RNN-bearing stages off the GPU. Do not route Prosody/Vocoder to `.cpuAndGPU`. |
+| MPSGraph abort (Metal route) | `SIGABRT` in MetalPerformanceShadersGraph while a GPU stage (noise / tail) runs under Core ML | iOS/iPadOS **27.0 through beta 8** (24A5430a), iPad17,2 and iPad16,2 | **Still live.** The default routing on OS 27 (`aneTailCpu`, #849) keeps Metal out of the chain. |
+| BNNS `vadd_fp16_sme` segfault (Metal-free route) | `SIGSEGV` in `libBNNS` `vadd_fp16_sme_internal` on the OS-27 default route (noise + tail on CPU) | iOS **27.0** (24A5418b), iPhone18,1, ~54 min into a session | **No safe Core ML route on iOS 27 is demonstrated** (#889). The model, phonemizer and voice packs are not at fault: the same Kokoro-82M v1.0 graph ran 2 h 34 min on ONNX Runtime's CPU provider on the same OS line. `initialize()` logs an advisory on the 27 line. |
+
+The BNNS segfault cannot be avoided by compute-unit routing — CoreML places
+segments on the BNNS CPU path even under `.cpuOnly` (#587), and on affected
+OS builds the same binary can flip between all-pass and all-crash across a
+day (#817). `KokoroAneManager.initialize()` logs a warning on affected OS
+builds. On macOS the remedy is the 26.6 line. On iOS the 26.6 line still
+crashes (#844), and on the iOS 27 line both Core ML routes have terminated
+the process (#889), so there is currently no OS version or routing on iOS
+that is demonstrated safe for long sessions; whether Kokoro ANE should be
+disabled by default there is tracked in #889.
+
+History: #328 (26.4 beta), #587 (iOS 26.4.2), #661 (cross-manager E5RT),
+#667 (M5/macOS 26.5), #817 (time/environment-gated evidence), #843/#849
+(OS 27 Metal abort, CPU-tail default), #844 (iOS 26.6), #889 (iOS 27 BNNS
+segfault on the CPU-tail route).
 
 ## Source
 

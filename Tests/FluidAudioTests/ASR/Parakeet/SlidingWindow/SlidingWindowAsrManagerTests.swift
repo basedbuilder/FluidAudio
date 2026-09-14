@@ -307,4 +307,27 @@ final class SlidingWindowAsrManagerTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Volatile text accumulation (#851)
+
+    func testAppendingVolatileExtendsRatherThanReplaces() {
+        XCTAssertEqual(
+            SlidingWindowAsrManager.appendingVolatile("first window", "second window"), "first window second window")
+    }
+
+    func testAppendingVolatileIgnoresEmptyFlushWindow() {
+        XCTAssertEqual(SlidingWindowAsrManager.appendingVolatile("first window", ""), "first window")
+        XCTAssertEqual(SlidingWindowAsrManager.appendingVolatile("", "only"), "only")
+        XCTAssertEqual(SlidingWindowAsrManager.appendingVolatile("", ""), "")
+    }
+
+    // MARK: - Trailing-word retirement (#897)
+
+    func testRemovingTrailingWordOnlyMatchesWholeWords() {
+        XCTAssertEqual(
+            SlidingWindowAsrManager.removingTrailingWord("an", from: "the net new code and an"), "the net new code and")
+        XCTAssertEqual(SlidingWindowAsrManager.removingTrailingWord("an", from: "an"), "")
+        XCTAssertNil(SlidingWindowAsrManager.removingTrailingWord("an", from: "we have a plan"), "suffix inside a word")
+        XCTAssertNil(SlidingWindowAsrManager.removingTrailingWord("an", from: "and so"))
+    }
 }

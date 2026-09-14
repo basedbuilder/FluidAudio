@@ -7,12 +7,14 @@ public enum KokoroAneError: Error, LocalizedError {
     case vocabMissing(URL)
     case vocabParseFailed(URL, String)
     case voicePackMissing(URL)
+    case voiceNotFound(voice: String, variant: KokoroAneVariant, available: [String])
     case invalidVoicePack(String)
     case phonemeSequenceTooLong(Int)
     case inputProcessingFailed(String)
     case acousticFramesExceedCap(have: Int, cap: Int)
     case predictionFailed(stage: String, underlying: Error)
     case unexpectedOutputShape(stage: String, expected: String, got: String)
+    case nonFiniteModelOutput(stage: String, output: String)
     case audioConversionFailed(String)
 
     public var errorDescription: String? {
@@ -25,6 +27,10 @@ public enum KokoroAneError: Error, LocalizedError {
             return "KokoroAne vocab.json not found at \(url.path)."
         case .vocabParseFailed(let url, let detail):
             return "KokoroAne vocab.json at \(url.path) is malformed: \(detail)"
+        case .voiceNotFound(let voice, let variant, let available):
+            return
+                "KokoroAne voice '\(voice)' is not available for the \(variant.rawValue) variant. "
+                + "Available: \(available.joined(separator: ", "))"
         case .voicePackMissing(let url):
             return "KokoroAne voice pack not found at \(url.path)."
         case .invalidVoicePack(let detail):
@@ -39,6 +45,11 @@ public enum KokoroAneError: Error, LocalizedError {
             return "KokoroAne stage '\(stage)' failed: \(err.localizedDescription)"
         case .unexpectedOutputShape(let stage, let expected, let got):
             return "KokoroAne stage '\(stage)' returned unexpected shape (expected \(expected), got \(got))."
+        case .nonFiniteModelOutput(let stage, let output):
+            return
+                "KokoroAne stage '\(stage)' returned non-finite values in '\(output)'. "
+                + "The CoreML runtime mis-executed the model on this OS (seen on iOS 27 betas, "
+                + "see FluidAudio issue #738)."
         case .audioConversionFailed(let detail):
             return "KokoroAne audio conversion failed: \(detail)"
         }

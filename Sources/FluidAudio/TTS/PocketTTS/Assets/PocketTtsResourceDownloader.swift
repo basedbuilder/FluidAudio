@@ -23,11 +23,11 @@ public enum PocketTtsResourceDownloader {
     /// - Returns: The directory that contains the requested `.mlmodelc`
     ///   packages plus `constants_bin/` for the requested language.
     ///
-    /// Note: the upstream `v2/<lang>/` directory ships both flowlm variants,
-    /// so a fresh download pulls the unused variant too. After download
-    /// completes, the unused FlowLM `.mlmodelc` directory is deleted so only
-    /// the requested precision occupies disk (~140 MB savings for `.int8`,
-    /// ~75 MB savings for `.fp16`).
+    /// Note: the upstream `v2/<lang>/` directory ships every precision and
+    /// placement variant side by side (both FlowLM precisions plus the
+    /// `_ane`/`pocket_state` packages). The download filter skips any
+    /// `.mlmodelc` outside `ModelNames.PocketTTS.requiredModels(precision:placement:)`,
+    /// so only the variants this call loads come over the network (#853).
     ///
     /// The downloader also skips redundant repo artifacts entirely:
     /// `.mlpackage` sources (CoreML never loads them — the compiled
@@ -59,6 +59,10 @@ public enum PocketTtsResourceDownloader {
         if allPresent {
             logger.info(
                 "PocketTTS \(language.rawValue) (\(precision)) models found in cache")
+            // Caches downloaded before the #853 variant-aware filter may still
+            // hold the unused FlowLM precision; complete caches return from
+            // this branch, so the post-download cleanup below never sees them.
+            removeUnusedFlowlmVariant(at: languageRoot, keeping: precision)
             // Pre-#592 caches lack `constants_bin/bos_before_voice.bin`. The
             // language-pack files are otherwise complete, so try to fetch just
             // the missing constant rather than re-downloading the whole subdir.
@@ -96,11 +100,11 @@ public enum PocketTtsResourceDownloader {
             subdirectory: subdir,
             to: repoDir,
             progressHandler: progressHandler,
-            shouldSkip: Self.shouldSkipAsset(at:)
+            shouldSkip: { Self.shouldSkipAsset(at: $0, required: required) }
         )
 
-        // The HF subdir contains both FlowLM precisions; delete the one we
-        // don't need so disk usage matches the loaded models.
+        // The filter above keeps the unused FlowLM variant off the network for
+        // fresh downloads; this cleans it off disk for caches that predate it.
         removeUnusedFlowlmVariant(at: languageRoot, keeping: precision)
 
         // The Trial 23 multifunction state package is not published on
@@ -148,13 +152,25 @@ public enum PocketTtsResourceDownloader {
     /// holds intermediate `.npy/.npz` files whose binary equivalents live
     /// under `constants_bin/`; `verify.wav` is an upstream debug artifact;
     /// `.DS_Store` is macOS junk.
-    @Sendable
-    private static func shouldSkipAsset(at path: String) -> Bool {
+    ///
+    /// `required` is the exact model set for the caller's precision +
+    /// placement (`ModelNames.PocketTTS.requiredModels(precision:placement:)`).
+    /// Any `.mlmodelc` bundle outside it is skipped whole — the upstream
+    /// directory ships every precision/placement variant side by side, and
+    /// without this the unused variants all came over the network (#853).
+    /// Skipping a directory path prunes the whole subtree in the lister, so
+    /// excluded bundles cost no tree-API calls either.
+    static func shouldSkipAsset(at path: String, required: Set<String>) -> Bool {
         let basename = (path as NSString).lastPathComponent
         if basename == ".DS_Store" || basename == "verify.wav" {
             return true
         }
         if basename.hasSuffix(".mlpackage") || path.contains(".mlpackage/") {
+            return true
+        }
+        if let bundle = path.split(separator: "/").first(where: { $0.hasSuffix(".mlmodelc") }),
+            !required.contains(String(bundle))
+        {
             return true
         }
         // Only skip the intermediate "constants/" subdirectory, never
@@ -331,6 +347,91 @@ public enum PocketTtsResourceDownloader {
         }
 
         return encoderPath
+    }
+
+    /// Ensure the pack-local per-language voice-cloning encoder
+    /// (`v2.1/<lang>/mimi_encoderv3.mlmodelc`) is available and return its URL.
+    ///
+    /// Every language pack ships its own mimi codec weights, so cloned-voice
+    /// conditioning must be encoded with the pack's own encoder (its speaker
+    /// projection is baked in — no host-side reprojection). Best-effort:
+    /// returns `nil` when the encoder can't be fetched (offline, or not yet
+    /// published for the pack); callers then fall back to the shared root
+    /// encoder + reprojection path (#793).
+    ///
+    /// Cache acceptance goes through `ModelCache.isCacheComplete`, not bare
+    /// directory existence: an interrupted download deliberately leaves
+    /// `*.partial` staging files behind for byte-range resume, and accepting
+    /// such a bundle would fail `MLModel(contentsOf:)` later without ever
+    /// taking the shared-encoder fallback (same class as issue #819).
+    ///
+    /// Throws only on cancellation — a cancelled caller must not be routed
+    /// into the fallback (or trigger further downloads); genuine
+    /// availability/network failures return `nil`.
+    public static func ensurePackMimiEncoder(
+        language: PocketTtsLanguage, directory: URL? = nil
+    ) async throws -> URL? {
+        do {
+            let targetDir = try directory ?? cacheDirectory()
+            let modelsDirectory = targetDir.appendingPathComponent(
+                PocketTtsConstants.defaultModelsSubdirectory)
+            let repoDir = modelsDirectory.appendingPathComponent(Repo.pocketTts.folderName)
+            let encoderSubpath =
+                "\(language.repoSubdirectory)/\(ModelNames.PocketTTS.mimiEncoderV3File)"
+            let encoderPath = repoDir.appendingPathComponent(encoderSubpath)
+
+            if ModelCache.isCacheComplete(at: repoDir, requiredFiles: [encoderSubpath]) {
+                return encoderPath
+            }
+
+            try FileManager.default.createDirectory(
+                at: repoDir, withIntermediateDirectories: true)
+
+            logger.info(
+                "Downloading per-language Mimi encoder for \(language.rawValue) voice cloning...")
+            try await ModelHub.download(
+                .pocketTts,
+                subdirectory: encoderSubpath,
+                to: repoDir
+            )
+
+            if ModelCache.isCacheComplete(at: repoDir, requiredFiles: [encoderSubpath]) {
+                return encoderPath
+            }
+
+            // Still incomplete after a resume attempt: a genuinely interrupted
+            // transfer resumes its `.partial` and completes above, so what's
+            // left is a corrupt bundle the resume path can't repair (e.g. a
+            // stale staging file next to complete weights). Clear it and
+            // re-download once from scratch — same delete-and-retry semantics
+            // as `ModelHub.loadWithRecovery`.
+            logger.warning(
+                "Per-language Mimi encoder bundle for \(language.rawValue) is corrupt after "
+                    + "resume; clearing and re-downloading once...")
+            try? FileManager.default.removeItem(at: encoderPath)
+            try await ModelHub.download(
+                .pocketTts,
+                subdirectory: encoderSubpath,
+                to: repoDir
+            )
+
+            guard ModelCache.isCacheComplete(at: repoDir, requiredFiles: [encoderSubpath]) else {
+                logger.warning(
+                    "Per-language Mimi encoder unavailable or incomplete for \(language.rawValue); "
+                        + "falling back to the shared encoder + reprojection (#793).")
+                return nil
+            }
+            return encoderPath
+        } catch {
+            if RetryPolicy.isCancellation(error) {
+                throw error
+            }
+            logger.warning(
+                "Failed to fetch per-language Mimi encoder for \(language.rawValue): "
+                    + "\(error.localizedDescription). Falling back to the shared encoder + "
+                    + "reprojection (#793).")
+            return nil
+        }
     }
 
     /// Ensure voice conditioning data for the given language is available,

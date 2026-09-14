@@ -138,6 +138,97 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
         XCTAssertEqual(removed1, 1, "Should report 1 removed (punctuation)")
     }
 
+    // MARK: - Issue #787: Temporal gating of prefix-collision dedup
+
+    /// Token IDs from issue #787: two different Russian words that share the
+    /// leading subword prefix " тра" + "ран" (= " тран").
+    /// 6841 = " тра" (leading space / word-start marker), 2394 = "ран".
+    private static let sharedPrefixA = 6841  // " тра"
+    private static let sharedPrefixB = 2394  // "ран"
+
+    /// The earlier word (трансформацию) sits in the tail of the accumulated
+    /// history; the later, different word (транскрибируется) opens the new chunk.
+    private var previousWithEarlierWord: [Int] {
+        [10, 11, 12, Self.sharedPrefixA, Self.sharedPrefixB, 9001, 13, 14, 15]
+    }
+    private var currentWithLaterWord: [Int] {
+        [Self.sharedPrefixA, Self.sharedPrefixB, 9002, 20, 21]
+    }
+
+    /// Without timestamps the legacy id-only matcher still strips the shared
+    /// prefix — this documents the #787 bug and pins the fallback behavior.
+    func testDedup_787_NoTimestamps_LegacyStripsSharedPrefix() {
+        let asrManager = AsrManager()
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord,
+            current: currentWithLaterWord
+        )
+        XCTAssertEqual(deduped, [9002, 20, 21], "Legacy id-only path removes the shared prefix")
+        XCTAssertEqual(removed, 2)
+    }
+
+    /// With global timestamps that put the two occurrences ~10s apart, the shared
+    /// prefix must NOT be treated as a duplicate — the later word stays intact.
+    func testDedup_787_FarApartTimestamps_KeepsSharedPrefix() {
+        let asrManager = AsrManager()
+        // 6841@frame 3, 2394@frame 4 in the earlier word.
+        let previousTs = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        // Same token IDs but ~10.4s (130 frames) later — a different utterance.
+        let currentTs = [130, 131, 132, 133, 134]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord,
+            current: currentWithLaterWord,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(
+            deduped, currentWithLaterWord,
+            "Temporally distant prefix collision must not be deduped (#787)")
+        XCTAssertEqual(removed, 0)
+    }
+
+    /// A genuine chunk-boundary duplicate (same acoustic moment, near-identical
+    /// global timestamps) must still be deduped when timestamps are supplied.
+    func testDedup_787_CloseTimestamps_StillDedupes() {
+        let asrManager = AsrManager()
+        let previousTs = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        // Same region re-decoded in the overlapping window: a few frames of jitter.
+        let currentTs = [3, 4, 5, 6, 7]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord,
+            current: currentWithLaterWord,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(deduped, [9002, 20, 21], "Real boundary overlap should still be deduped")
+        XCTAssertEqual(removed, 2)
+    }
+
+    /// A gap just outside `frameTolerance` is rejected; just inside is accepted.
+    func testDedup_787_ToleranceBoundary() {
+        let asrManager = AsrManager()
+        let previousTs = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        let tolerance = ASRConstants.duplicateFrameTolerance
+
+        // prefix at prev frame 3; current just beyond tolerance -> keep
+        let justOutside = [3 + tolerance + 1, 3 + tolerance + 2, 100, 101, 102]
+        let (dedupedOut, removedOut) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord, current: currentWithLaterWord,
+            previousTimestamps: previousTs, currentTimestamps: justOutside)
+        XCTAssertEqual(removedOut, 0, "Gap beyond tolerance is not a duplicate")
+        XCTAssertEqual(dedupedOut, currentWithLaterWord)
+
+        // current just within tolerance -> dedup
+        let justInside = [3 + tolerance, 4 + tolerance, 100, 101, 102]
+        let (dedupedIn, removedIn) = asrManager.removeDuplicateTokenSequence(
+            previous: previousWithEarlierWord, current: currentWithLaterWord,
+            previousTimestamps: previousTs, currentTimestamps: justInside)
+        XCTAssertEqual(removedIn, 2, "Gap within tolerance is a duplicate")
+        XCTAssertEqual(dedupedIn, [9002, 20, 21])
+    }
+
     // MARK: - SequenceMatcher Utility Tests
 
     /// Test SequenceMatcher.findSuffixPrefixMatch
@@ -281,5 +372,254 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
                 matcher: exactMatcher
             )
         }
+    }
+
+    // MARK: - Issue #855: last-window overlap re-decode must be stripped
+
+    /// Captured from the issue #855 repro (repetitive speech, final flush window
+    /// re-decoded from frame 0): the previous tail ends "...would go for where we
+    /// would." and the re-decode repeats that run 1-3 frames later before the new
+    /// words (" remove filler words."). The temporally-gated dedup must strip the
+    /// re-decoded overlap (including the partial leading token) and keep the new
+    /// trailing words.
+    func testDedup_855_LastWindowRedecodeStripped() {
+        let asrManager = AsrManager()
+        let previous = [
+            4223, 6882, 317, 910, 3463, 6314, 1316, 7950, 283, 7877, 1974, 4223, 1455, 509, 6843, 750, 4223, 7883,
+        ]
+        let previousTs = [100, 103, 105, 106, 108, 111, 113, 115, 117, 120, 122, 124, 126, 128, 130, 131, 134, 137]
+        // 5831 is a partial word at the window edge; 4223...4223 re-decodes the
+        // previous tail; 4942... are the genuinely new trailing words.
+        let current = [5831, 4223, 1455, 509, 6843, 750, 4223, 4942, 1337, 309, 6312, 4128, 7870, 7883]
+        let currentTs = [122, 125, 127, 130, 133, 135, 137, 139, 141, 144, 146, 150, 152, 154]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previous,
+            current: current,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(
+            deduped, [4942, 1337, 309, 6312, 4128, 7870, 7883],
+            "Re-decoded overlap must be stripped; trailing words must survive")
+        XCTAssertEqual(removed, 7)
+    }
+
+    /// Same trace with the timestamps 10s apart: the identical token runs are then
+    /// genuine repetition, not a seam duplicate, and must be kept (gate holds).
+    func testDedup_855_FarApartRepetitionKept() {
+        let asrManager = AsrManager()
+        let previous = [1974, 4223, 1455, 509, 6843, 750, 4223]
+        let previousTs = [10, 12, 14, 16, 18, 20, 22]
+        let current = [1974, 4223, 1455, 509, 6843, 750, 4223, 4942]
+        let currentTs = [145, 147, 149, 151, 153, 155, 157, 159]
+
+        let (deduped, removed) = asrManager.removeDuplicateTokenSequence(
+            previous: previous,
+            current: current,
+            previousTimestamps: previousTs,
+            currentTimestamps: currentTs
+        )
+        XCTAssertEqual(deduped, current, "Repetition ~10s later is not a seam duplicate")
+        XCTAssertEqual(removed, 0)
+    }
+
+    // MARK: - Issue #855: final-window re-decode plan (decoder-entry behavior)
+
+    /// The plan drives the production decoder entry: frame-0 re-decode plus an
+    /// emission cutoff. Removing the production change removes this helper, so
+    /// these tests are coupled to the fix itself, not just to dedup.
+    func testRedecodePlan_LastStreamingChunk() {
+        let plan = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [1, 2, 3],
+            previousTokenTimestamps: [130, 134, 137],
+            globalFrameOffset: 112
+        )
+        XCTAssertEqual(plan.initialTimeIndexOverride, 0, "Final window must re-decode from frame 0")
+        XCTAssertEqual(
+            plan.emitTokensAfterFrame,
+            137 - 112 - AsrManager.redecodeEmissionJitterFrames,
+            "Cutoff = last emitted frame in window-local space minus the jitter margin")
+    }
+
+    func testRedecodePlan_CutoffClampedToZero() {
+        let plan = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [1],
+            previousTokenTimestamps: [3],
+            globalFrameOffset: 112
+        )
+        XCTAssertEqual(plan.initialTimeIndexOverride, 0)
+        XCTAssertEqual(plan.emitTokensAfterFrame, 0, "Cutoff before the window start suppresses nothing")
+    }
+
+    func testRedecodePlan_InactiveOutsideFinalStreamingWindow() {
+        let interior = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: false,
+            previousTokens: [1, 2],
+            previousTokenTimestamps: [10, 20],
+            globalFrameOffset: 0
+        )
+        XCTAssertNil(interior.initialTimeIndexOverride)
+        XCTAssertNil(interior.emitTokensAfterFrame)
+
+        let noTimestamps = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [1, 2],
+            previousTokenTimestamps: nil,
+            globalFrameOffset: 0
+        )
+        XCTAssertNil(noTimestamps.initialTimeIndexOverride, "Batch callers (no timestamps) keep legacy navigation")
+
+        let firstWindow = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [],
+            previousTokenTimestamps: [],
+            globalFrameOffset: 0
+        )
+        XCTAssertNil(firstWindow.initialTimeIndexOverride, "Single-window streams have nothing to re-decode")
+    }
+
+    // MARK: - Issue #897: final-window seam reconciliation
+
+    /// Clip 03 of the #855 fixtures: window 1 ends `▁and`@153 `▁an`@156 (the
+    /// fragment of "analyzing" cut by the window edge); the re-decoded final
+    /// window emits `,`@152 `▁and`@155 `▁anal`@159 `y`@162 … The cutoff must
+    /// anchor at the last word start, the fragment must go, and the seam
+    /// comma plus the re-emitted `and` must not survive as duplicates.
+    func testRedecodePlan_CutoffAnchorsAtLastWordStart() {
+        let plan = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [10, 11, 12, 13],
+            previousTokenTimestamps: [147, 149, 153, 156],
+            globalFrameOffset: 112,
+            lastWordStartFrame: 156
+        )
+        XCTAssertEqual(plan.emitTokensAfterFrame, 156 - 112 - AsrManager.redecodeEmissionJitterFrames)
+        // A multi-token last word anchors at its first token, not its last.
+        let multi = AsrManager.lastChunkRedecodePlan(
+            isLastChunk: true,
+            previousTokens: [10, 11, 12],
+            previousTokenTimestamps: [140, 150, 160],
+            globalFrameOffset: 112,
+            lastWordStartFrame: 150
+        )
+        XCTAssertEqual(multi.emitTokensAfterFrame, 150 - 112 - AsrManager.redecodeEmissionJitterFrames)
+    }
+
+    func testTrailingWordStartIndex() {
+        XCTAssertEqual(AsrManager.trailingWordStartIndex(pieces: ["▁c", "ode", "▁and", "▁an"]), 3)
+        // The loaded vocabulary normalizes the boundary to a leading space.
+        XCTAssertEqual(AsrManager.trailingWordStartIndex(pieces: [" c", "ode", " and", " an"]), 3)
+        XCTAssertEqual(AsrManager.trailingWordStartIndex(pieces: ["▁c", "ode", "▁anal", "y", "z"]), 2)
+        XCTAssertNil(AsrManager.trailingWordStartIndex(pieces: ["▁one", "word"]), "index 0 would drop everything")
+        XCTAssertNil(AsrManager.trailingWordStartIndex(pieces: ["no", "starts"]))
+        XCTAssertNil(AsrManager.trailingWordStartIndex(pieces: []))
+    }
+
+    func testReconcileFinalWindowSeam_DropsFragmentSeamCommaAndReemittedWord() {
+        // The comma is not in ASRConstants.punctuationTokens; it is recognized by piece text.
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3, 4],  // ▁c ode ▁and ▁an
+            previousTimestamps: [147, 149, 153, 156],
+            trailingWordStart: 3,
+            currentTokens: [99, 3, 5, 6, 7, 8],  // , ▁and ▁anal y z ing
+            currentTimestamps: [152, 155, 159, 162, 164, 166],
+            currentPieces: [",", " and", " anal", "y", "z", "ing"],
+            previousPieces: [" c", "ode", " and", " an"],
+            punctuationTokens: []
+        )
+        XCTAssertEqual(seam.droppedPrevious, 1, "the fragment `an` is retired")
+        XCTAssertEqual(seam.droppedCurrent, 2, "seam comma + re-emitted `and` (dup of the kept `and`@153)")
+    }
+
+    func testIsPunctuationPiece() {
+        XCTAssertTrue(AsrManager.isPunctuationPiece(","))
+        XCTAssertTrue(AsrManager.isPunctuationPiece("▁."))
+        XCTAssertTrue(AsrManager.isPunctuationPiece(" ?"))
+        XCTAssertFalse(AsrManager.isPunctuationPiece(" and"))
+        XCTAssertFalse(AsrManager.isPunctuationPiece("▁"))
+        XCTAssertFalse(AsrManager.isPunctuationPiece(""))
+    }
+
+    func testReconcileFinalWindowSeam_KeepsGenuineLeadingTokens() {
+        // Current starts with a new word that duplicates nothing: nothing dropped from it.
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3],
+            previousTimestamps: [100, 104, 108],
+            trailingWordStart: 2,
+            currentTokens: [9, 10],
+            currentTimestamps: [110, 114],
+            punctuationTokens: [7883]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 1)
+        XCTAssertEqual(seam.droppedCurrent, 0)
+        // Punctuation after the last word start is real, not a seam artifact.
+        let late = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3],
+            previousTimestamps: [100, 104, 108],
+            trailingWordStart: 2,
+            currentTokens: [7883, 9],
+            currentTimestamps: [120, 124],
+            punctuationTokens: [7883]
+        )
+        XCTAssertEqual(late.droppedCurrent, 0)
+        // The final window re-emitted nothing for the previous word (empty flush,
+        // or only tokens before its onset): keep the previous word, drop nothing.
+        let emptyFinal = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3, 4],  // … ▁them ▁out .
+            previousTimestamps: [250, 254, 258, 261],
+            trailingWordStart: 2,
+            currentTokens: [],
+            currentTimestamps: []
+        )
+        XCTAssertEqual(emptyFinal.droppedPrevious, 0, "nothing re-emitted the word; the tail must survive")
+        XCTAssertEqual(emptyFinal.droppedCurrent, 0)
+        let earlyOnly = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3, 4],
+            previousTimestamps: [250, 254, 258, 261],
+            trailingWordStart: 2,
+            currentTokens: [7883],
+            currentTimestamps: [240],
+            currentPieces: ["."],
+            punctuationTokens: []
+        )
+        XCTAssertEqual(earlyOnly.droppedPrevious, 0)
+        // A short final window that ends where the previous one ended re-emits
+        // "out" but not the "."; keep the previous "out." and strip the re-emission.
+        let sameEnd = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3, 4],  // … ▁them ▁out .
+            previousTimestamps: [250, 254, 258, 261],
+            trailingWordStart: 2,
+            currentTokens: [3],  // ▁out
+            currentTimestamps: [259]
+        )
+        XCTAssertEqual(sameEnd.droppedPrevious, 0, "re-decode saw no more audio than the previous window")
+        XCTAssertEqual(sameEnd.droppedCurrent, 1, "the re-emitted `out` duplicates the kept one")
+        // The re-decode saw more audio but its first word IS the previous last
+        // word: it was complete, so keep the previous copy (with its period) and
+        // drop the re-emission. Only a *different* first word retires it.
+        let sameWord = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3, 4],  // … ▁them ▁out .
+            previousTimestamps: [250, 254, 258, 261],
+            trailingWordStart: 2,
+            currentTokens: [3, 9],  // ▁out <silence-token>
+            currentTimestamps: [259, 270],
+            currentPieces: [" out", " uh"],
+            previousPieces: [" help", " them", " out", "."]
+        )
+        XCTAssertEqual(sameWord.droppedPrevious, 0)
+        XCTAssertEqual(sameWord.droppedCurrent, 1)
+        XCTAssertEqual(AsrManager.wordCore([" out", "."]), "out")
+        XCTAssertEqual(AsrManager.wordCore([" anal", "y", "z", "ing"]), "analyzing")
+        XCTAssertEqual(AsrManager.firstWordPieces([",", " and", " anal", "y"]), [" and"])
+        XCTAssertEqual(AsrManager.firstWordPieces([" anal", "y", "z", "ing", " if"]), [" anal", "y", "z", "ing"])
+        // Degenerate inputs are a no-op.
+        XCTAssertEqual(
+            AsrManager.reconcileFinalWindowSeam(
+                previousTokens: [1], previousTimestamps: [5], trailingWordStart: 0,
+                currentTokens: [2], currentTimestamps: [6]
+            ).droppedPrevious, 0)
     }
 }

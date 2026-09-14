@@ -126,7 +126,11 @@ public struct OfflineDiarizerConfig: Sendable {
     }
 
     public struct Clustering: Sendable {
-        /// Euclidean distance threshold for unit-normalized embeddings.
+        /// Euclidean distance threshold for unit-normalized embeddings, in [0, 2].
+        ///
+        /// Applied directly as the AHC dendrogram cut distance (pyannote parity):
+        /// embeddings closer than this merge into one cluster, so **larger values
+        /// merge more aggressively and yield fewer speakers**.
         public var threshold: Double
 
         /// VBx warm-start parameters (Fa controls precision, Fb controls recall)
@@ -134,16 +138,29 @@ public struct OfflineDiarizerConfig: Sendable {
         public var warmStartFb: Double
 
         /// Minimum number of speakers. Ignored if `numSpeakers` is set.
+        ///
+        /// Only binds when the auto-detected count falls below it; it cannot
+        /// change a partition whose count already satisfies the bound.
         public var minSpeakers: Int?
 
         /// Maximum number of speakers. Ignored if `numSpeakers` is set.
         public var maxSpeakers: Int?
 
         /// Exact number of speakers. Overrides `minSpeakers` and `maxSpeakers` when set.
+        ///
+        /// Treated as a target, not a guarantee: when it differs from the
+        /// auto-detected count, embeddings are re-clustered with K-Means to this
+        /// count, but downstream assignment may leave some clusters unused.
         public var numSpeakers: Int?
 
         /// Preserve initial AHC clusters when automatic diarization has no speaker-count constraints.
         public var preserveAutomaticAHCClusters: Bool
+        /// When true (pyannote parity), local speakers sharing a segmentation
+        /// chunk are assigned to distinct clusters instead of each snapping to
+        /// its nearest centroid independently. Automatically disabled when the
+        /// speaker count is forced via `numSpeakers`/`minSpeakers`/`maxSpeakers`
+        /// re-clustering.
+        public var constrainedAssignment: Bool
 
         public static let community = Clustering(
             threshold: 0.6,
@@ -151,7 +168,8 @@ public struct OfflineDiarizerConfig: Sendable {
             warmStartFb: 0.8,
             minSpeakers: nil,
             maxSpeakers: nil,
-            numSpeakers: nil
+            numSpeakers: nil,
+            constrainedAssignment: true
         )
 
         public init(
@@ -161,7 +179,8 @@ public struct OfflineDiarizerConfig: Sendable {
             minSpeakers: Int? = nil,
             maxSpeakers: Int? = nil,
             numSpeakers: Int? = nil,
-            preserveAutomaticAHCClusters: Bool = false
+            preserveAutomaticAHCClusters: Bool = false,
+            constrainedAssignment: Bool = true
         ) {
             self.threshold = threshold
             self.warmStartFa = warmStartFa
@@ -170,6 +189,7 @@ public struct OfflineDiarizerConfig: Sendable {
             self.maxSpeakers = maxSpeakers
             self.numSpeakers = numSpeakers
             self.preserveAutomaticAHCClusters = preserveAutomaticAHCClusters
+            self.constrainedAssignment = constrainedAssignment
         }
     }
 
@@ -347,10 +367,11 @@ public struct OfflineDiarizerConfig: Sendable {
 
     /// Validate configuration values and throw if they fall outside expected ranges.
     public func validate() throws {
-        let maxClusteringThreshold = sqrt(2.0)
+        // Euclidean distances between unit-normalized embeddings live in [0, 2].
+        let maxClusteringThreshold = 2.0
         guard clustering.threshold > 0, clustering.threshold <= maxClusteringThreshold else {
             throw OfflineDiarizationError.invalidConfiguration(
-                "clustering.threshold must be within (0, sqrt(2)], got \(clustering.threshold)"
+                "clustering.threshold must be within (0, 2], got \(clustering.threshold)"
             )
         }
 
@@ -655,6 +676,46 @@ public struct VBxOutput: Sendable {
         self.elbos = elbos
         self.wasAdjusted = wasAdjusted
         self.originalClusterCount = originalClusterCount
+    }
+
+    /// Mixture-weight epsilon below which a VBx cluster counts as collapsed.
+    public static let activeClusterEpsilon = 1e-7
+
+    /// Number of clusters VBx actually kept (mixture weight above epsilon).
+    ///
+    /// VBx is warm-started with the AHC cluster count (`numClusters`) and prunes
+    /// clusters by driving their mixture weight to zero, so this — not
+    /// `numClusters` — is the auto-detected speaker count (pyannote parity).
+    ///
+    /// Note: a cluster can keep trace mixture weight without ever being any
+    /// embedding's best cluster; `assignedClusterCount` is the count callers
+    /// actually observe after hard assignment.
+    public var activeClusterCount: Int {
+        guard !pi.isEmpty else { return numClusters }
+        return pi.filter { $0 > Self.activeClusterEpsilon }.count
+    }
+
+    /// Number of clusters that win at least one embedding's argmax responsibility.
+    ///
+    /// A cluster can survive the `pi > epsilon` test while never being any
+    /// embedding's best cluster; it then receives no hard assignments and
+    /// vanishes from the pipeline output. Speaker-count constraints must be
+    /// checked against this count — the one callers see — or a request equal to
+    /// the pi-census is silently ignored while the output shows fewer speakers.
+    public var assignedClusterCount: Int {
+        guard !gamma.isEmpty else { return activeClusterCount }
+        var winners = Set<Int>()
+        for row in gamma {
+            guard !row.isEmpty else { continue }
+            var best = 0
+            var bestValue = row[0]
+            for index in 1..<row.count where row[index] > bestValue {
+                bestValue = row[index]
+                best = index
+            }
+            winners.insert(best)
+        }
+        return winners.isEmpty ? activeClusterCount : winners.count
     }
 }
 

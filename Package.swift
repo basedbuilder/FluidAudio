@@ -28,6 +28,7 @@ let package = Package(
                 "NemoTextProcessing",
             ],
             path: "Sources/FluidAudio",
+            exclude: ["ASR/Parakeet/Unified/benchmark.md"],
             resources: [
                 // Keep .process: .copy of a Resources-named directory breaks Apple code signing on iOS.
                 .process("TTS/LuxTts/G2p/Resources")
@@ -35,6 +36,8 @@ let package = Package(
         ),
         // Byte-exact NeMo text normalization (FST engine, all 7 languages).
         // Prebuilt xcframework from FluidInference/text-processing-rs v0.3.0.
+        // Always linked on tools < 6.2; Package@swift-6.2.swift exposes it as
+        // the opt-out `NemoTextProcessing` trait (#880, #888).
         .binaryTarget(
             name: "NemoTextProcessing",
             url:
@@ -67,7 +70,10 @@ let package = Package(
                 "FluidAudioCLI",
             ],
             resources: [
-                .process("TTS/LuxTts/Resources")
+                .process("TTS/LuxTts/Resources"),
+                // Real recordings (cleared for public release by the speaker) for the
+                // streaming final-window regression, issue #855.
+                .copy("ASR/Parakeet/SlidingWindow/Fixtures"),
             ]
         ),
     ],

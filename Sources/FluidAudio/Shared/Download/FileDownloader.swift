@@ -1072,6 +1072,12 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
     /// cancels the task if fewer than `minStallBytes` arrived since the last
     /// wake — catching a frozen CDN connection in seconds rather than waiting
     /// out the request's idle `timeout`.
+    ///
+    /// When `cancel()` already ran (a pre-cancelled Swift task fires its
+    /// cancellation handler before the operation body), the continuation is
+    /// failed here directly: the URLSession task is cancelled before its
+    /// `resume()`, so it never loads and never delivers
+    /// `didCompleteWithError` — waiting on the delegate would hang.
     func attach(
         continuation: CheckedContinuation<HTTPURLResponse, Error>,
         task: URLSessionDataTask
@@ -1092,12 +1098,16 @@ private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate,
             st.bytesAtWindowStart = resumeOffset
             if st.cancellationRequested {
                 st.watchdog = nil
+                st.continuation = nil
+                st.finished = true
+                st.resolutionCommitted = true
             }
             return st.cancellationRequested
         }
         if shouldCancel {
             timer?.cancel()
             task.cancel()
+            continuation.resume(throwing: CancellationError())
         }
     }
 
