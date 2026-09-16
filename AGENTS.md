@@ -23,9 +23,9 @@ swift format --in-place --recursive --configuration .swift-format Sources/ Tests
 
 - **NEVER** use `@unchecked Sendable` - implement proper thread safety with actors/MainActor
 - **NEVER** create dummy/mock models or synthetic audio data - use real models only
-- **NEVER** create simplified versions - implement full solutions or consult first
+- Complete the requested behavior with the smallest maintainable solution; ask only when a missing choice materially changes that behavior.
 - **NEVER** run `git push` unless explicitly requested by user
-- Add unit tests when writing new code
+- Add regression coverage when it proves changed behavior or a meaningful failure mode.
 
 ## Code Style (swift-format config)
 
@@ -44,4 +44,4 @@ swift format --in-place --recursive --configuration .swift-format Sources/ Tests
 
 ## Mobius Plan
 
-When users ask you to perform tasks that might be more compilcated, make sure you look at PLANS.md and follow the instructions there to plan the change out first and follow the instructions there. The plans should be in a .mobius/ folder and never committed directly to Github
+Use a saved plan when requested or when architecture, migration, recovery or cross-session coordination needs it. Read applicable `PLANS.md` policy when creating or implementing one; routine bounded fixes can use an in-thread plan. Keep this repo's plans in `.mobius/` and out of GitHub.
