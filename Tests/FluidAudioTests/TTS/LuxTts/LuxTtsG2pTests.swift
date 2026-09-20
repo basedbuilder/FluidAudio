@@ -13,16 +13,22 @@ import XCTest
 final class LuxTtsG2pTests: XCTestCase {
 
     func testFixtureResourcesAreProcessedAtBundleRoot() {
+        // `resourceURL`, not `bundleURL`: a flat bundle puts resources at the
+        // bundle root, a macOS-structured one under `Contents/Resources`, and
+        // which of the two SwiftPM emits depends on the toolchain. What the
+        // test pins is that `.process` flattened the source `Resources/`
+        // directory rather than copying it in whole (a copied, reserved
+        // `Resources` directory breaks Apple code signing on iOS).
+        let resources = Bundle.module.resourceURL ?? Bundle.module.bundleURL
         XCTAssertFalse(
             FileManager.default.fileExists(
-                atPath: Bundle.module.bundleURL
-                    .appendingPathComponent("Resources", isDirectory: true).path
+                atPath: resources.appendingPathComponent("Resources", isDirectory: true).path
             ),
             "LuxTTS test resources must not create a reserved top-level Resources directory"
         )
         XCTAssertTrue(
             FileManager.default.fileExists(
-                atPath: Bundle.module.bundleURL.appendingPathComponent("luxtts_fixtures.json").path
+                atPath: resources.appendingPathComponent("luxtts_fixtures.json").path
             )
         )
     }
