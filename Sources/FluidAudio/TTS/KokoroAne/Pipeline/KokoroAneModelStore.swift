@@ -172,6 +172,7 @@ public actor KokoroAneModelStore {
     private var voicePacks: [String: KokoroAneVoicePack] = [:]
     private var repoDirectory: URL?
     private var mandarinG2P: MandarinG2P?
+    private var japaneseG2P: JapaneseG2P?
     private var mandarinCustomLexicon: MandarinCustomLexicon = .empty
 
     private let directory: URL?
@@ -331,6 +332,27 @@ public actor KokoroAneModelStore {
         return pipeline
     }
 
+    /// Lazy-load and cache the Japanese frontend (MeCab over the trimmed
+    /// unidic-lite dictionary + Cutlet rules). The asset download is
+    /// independent of the CoreML model download and occurs only when a caller
+    /// supplies plain Japanese text.
+    func japaneseG2PPipeline() async throws -> JapaneseG2P {
+        if let japaneseG2P { return japaneseG2P }
+        guard variant == .japanese else {
+            throw KokoroAneError.inputProcessingFailed(
+                "Japanese G2P requested on a non-japanese store")
+        }
+        let repoDirectory =
+            try repoDirectory
+            ?? KokoroAneResourceDownloader.repositoryDirectory(
+                variant: .japanese, directory: directory)
+        let g2pDirectory = try await KokoroAneResourceDownloader.ensureJapaneseG2P(repoDirectory: repoDirectory)
+        let pipeline = try JapaneseG2P(directory: g2pDirectory)
+        japaneseG2P = pipeline
+        logger.info("Loaded Japanese G2P (MeCab + Cutlet)")
+        return pipeline
+    }
+
     /// Best-effort load of the g2pW polyphone disambiguator. Returns
     /// `nil` (and logs) when the assets are missing or fail to load,
     /// so the Mandarin G2P pipeline can keep running on the dict
@@ -381,5 +403,6 @@ public actor KokoroAneModelStore {
         vocab = nil
         repoDirectory = nil
         mandarinG2P = nil
+        japaneseG2P = nil
     }
 }

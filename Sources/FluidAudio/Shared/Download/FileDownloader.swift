@@ -180,6 +180,7 @@ enum FileDownloader {
         file: RemoteFile,
         from repoRemotePath: String,
         at destination: URL,
+        revision: String = "main",
         recoveringBlockedPaths: Bool,
         config: DownloadConfig = .default,
         configuration: URLSessionConfiguration? = nil,
@@ -194,6 +195,7 @@ enum FileDownloader {
                 file: file,
                 from: repoRemotePath,
                 at: resolvedDestination,
+                revision: revision,
                 recoveringBlockedPaths: recoveringBlockedPaths,
                 config: config,
                 configuration: configuration,
@@ -211,6 +213,7 @@ enum FileDownloader {
         file: RemoteFile,
         from repoRemotePath: String,
         at destination: URL,
+        revision: String,
         recoveringBlockedPaths: Bool,
         config: DownloadConfig,
         configuration: URLSessionConfiguration?,
@@ -237,7 +240,7 @@ enum FileDownloader {
 
         let encodedPath =
             file.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? file.path
-        let fileURL = try ModelRegistry.resolveModel(repoRemotePath, encodedPath)
+        let fileURL = try ModelRegistry.resolveModel(repoRemotePath, encodedPath, revision: revision)
         let request = HFClient.authorizedRequest(url: fileURL, timeout: config.timeout)
 
         let tempURL = try await download(

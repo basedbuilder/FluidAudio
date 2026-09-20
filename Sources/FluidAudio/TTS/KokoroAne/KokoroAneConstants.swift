@@ -157,6 +157,26 @@ public enum KokoroAneConstants {
     /// Remote artefact filenames (mirrors the local names — no rename).
     public static let g2pwVocabRemoteFile = "vocab.txt"
     public static let g2pwPolyphonicCharsRemoteFile = "POLYPHONIC_CHARS.txt"
+
+    // MARK: - Japanese frontend (MeCab over trimmed unidic-lite + Cutlet rules)
+
+    /// Remote subdirectory of `g2pRemoteRepo` holding the Japanese assets,
+    /// mirroring the Mandarin layout (`ANE-zh/assets`).
+    public static let japaneseG2PRemoteSubdir = "ANE-ja/assets"
+
+    /// MeCab dictionary set trimmed to `pos1,pron,kana` features by
+    /// `mobius/models/tts/kokoro/coreml/g2p/convert_unidic_lite.py`, plus
+    /// Cutlet's word list. Downloaded into `<repoDir>/g2p/` on first
+    /// plain-text call (about 115 MB, dominated by the connection matrix).
+    public static let japaneseSystemDictionaryFile = "sys.dic"
+    public static let japaneseUnknownDictionaryFile = "unk.dic"
+    public static let japaneseCharCategoryFile = "char.bin"
+    public static let japaneseConnectionMatrixFile = "matrix.bin"
+    public static let japaneseWordListFile = "ja_words.txt"
+    public static let japaneseG2PFiles = [
+        japaneseSystemDictionaryFile, japaneseUnknownDictionaryFile, japaneseCharCategoryFile,
+        japaneseConnectionMatrixFile, japaneseWordListFile,
+    ]
 }
 
 /// Language variant of the laishere/kokoro 7-stage CoreML chain.
@@ -170,12 +190,11 @@ public enum KokoroAneConstants {
 /// |--------------|------------|---------------|-------------------------------|------------------------------|
 /// | `.english`   | `ANE/`     | `af_heart`    | flat (`<voice>.bin`)          | `KokoroAneEnglishPhonemizer` |
 /// | `.mandarin`  | `ANE-zh/`  | `zf_001`      | nested (`voices/<voice>.bin`) | `MandarinG2P`                |
-/// | `.japanese`  | `ANE-ja/`  | `jf_alpha`    | nested (`voices/<voice>.bin`) | none — phoneme bypass only   |
+/// | `.japanese`  | `ANE-ja/`  | `jf_alpha`    | nested (`voices/<voice>.bin`) | `JapaneseG2P` (MeCab+Cutlet) |
 ///
-/// The Japanese variant ships **no in-process text → phoneme frontend**.
-/// `synthesize(text:)` / `phonemes(for:)` throw for `.japanese`; callers feed
-/// pre-computed IPA through ``KokoroAneManager/synthesizeFromPhonemes(_:voice:speed:)``
-/// (the bypass path the 7-stage chain already supports). See issue #698.
+/// The Japanese variant accepts plain kana/kanji through its in-process
+/// MeCab + Cutlet frontend. Pre-computed IPA remains supported through
+/// ``KokoroAneManager/synthesizeFromPhonemes(_:voice:speed:)``. See #698/#914.
 public enum KokoroAneVariant: String, CaseIterable, Sendable {
     case english
     case mandarin

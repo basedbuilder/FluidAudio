@@ -2,6 +2,8 @@ import Foundation
 
 /// Model repositories on HuggingFace
 public enum Repo: String, CaseIterable, Sendable {
+    /// CUA-S1-FORMS form-option decision scorer. See Decision/CuaS1Forms.
+    case cuaS1Forms = "FluidInference/cua-s1-forms-coreml"
     case vad = "FluidInference/silero-vad-coreml"
     case parakeetV3 = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
     case parakeetV2 = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
@@ -96,10 +98,32 @@ public enum Repo: String, CaseIterable, Sendable {
     /// Conversion lives in mobius (`models/tts/inflect-v2`).
     case inflectMicro = "FluidInference/inflect-v2-coreml/micro"
     case inflectNano = "FluidInference/inflect-v2-coreml/nano"
+    /// Chatterbox Multilingual (ResembleAI, 23 languages, **beta**) — T3 Llama-520M
+    /// AR speech-token generator (CFG batch 2, MLState KV decode) + S3Gen
+    /// flow-matching mel decoder + HiFT vocoder. Repo root holds the
+    /// `.mlmodelc` bundles plus `tables/` (embedding/positional tables and
+    /// the precomputed default voice, safetensors) and `tokenizer/` (23-lang
+    /// grapheme BPE). The `.mlpackage` sources and the I/O-KV decode variant
+    /// alongside them are never downloaded. Conversion lives in mobius
+    /// (`models/tts/chatterbox/coreml`).
+    case chatterbox = "FluidInference/chatterbox-multilingual-coreml"
+    /// Chatterbox Nano (ResembleAI, 110M, English, **beta**) — T3 GPT2-small AR
+    /// speech-token generator (batch 1, MLState KV decode) + S3Gen 2-step
+    /// meanflow mel decoder + HiFT vocoder. Same repo layout as
+    /// `.chatterbox`; `tokenizer/` holds the GPT2 BPE assets (vocab.json,
+    /// merges.txt, added_tokens.json — 20 paralinguistic tags). Conversion
+    /// lives in mobius (`models/tts/chatterbox/coreml`).
+    case chatterboxNano = "FluidInference/chatterbox-nano-coreml"
 
     /// Repository slug (without owner)
     public var name: String {
         switch self {
+        case .cuaS1Forms:
+            return "cua-s1-forms-coreml"
+        case .chatterbox:
+            return "chatterbox-multilingual-coreml"
+        case .chatterboxNano:
+            return "chatterbox-nano-coreml"
         case .neuTts:
             return "neutts-2e-coreml"
         case .nemotronMultilingual:
@@ -210,6 +234,21 @@ public enum Repo: String, CaseIterable, Sendable {
             return "FluidInference/inflect-v2-coreml"
         default:
             return "FluidInference/\(name)"
+        }
+    }
+
+    /// Immutable Hugging Face revision used for downloads.
+    ///
+    /// Most repositories retain the historical `main` behavior. Repositories
+    /// with reviewed supply-chain metadata can opt into a pinned commit so a
+    /// mutable Hub branch cannot silently change the files loaded by a released
+    /// FluidAudio version.
+    public var revision: String {
+        switch self {
+        case .diarizer:
+            return "df2625ac79a7ac6b65ad868fee6d80f320da4232"
+        default:
+            return "main"
         }
     }
 
@@ -428,6 +467,16 @@ public enum PocketTtsModelPlacement: String, Sendable, Hashable {
 
 /// Centralized model names for all FluidAudio components
 public enum ModelNames {
+
+    /// CUA-S1-FORMS model artifact names.
+    public enum CuaS1Forms {
+        /// Fixed 32-option FP16 decision scorer.
+        public static let model = "cua_s1_forms_fp16_options32"
+        /// Compiled scorer downloaded by the Swift manager.
+        public static let modelFile = model + ".mlmodelc"
+        /// Complete set of runtime model artifacts.
+        public static let requiredModels: Set<String> = [modelFile]
+    }
 
     /// Diarizer model names
     public enum Diarizer {
@@ -1614,6 +1663,75 @@ public enum ModelNames {
         ]
     }
 
+    /// Chatterbox Multilingual model names
+    /// (`FluidInference/chatterbox-multilingual-coreml`).
+    public enum Chatterbox {
+        public static let prefillFile = "T3-Prefill-T256-M1024-fp16.mlmodelc"
+        public static let decodeFile = "T3-Decode-M1024-fp16-stateful.mlmodelc"
+        public static let flowFile = "Flow-N500-fp16.mlmodelc"
+        public static let vocoderFile = "HiFT-T1000-fp16.mlmodelc"
+        public static let tablesFile = "tables/tables.safetensors"
+        public static let defaultVoiceFile = "tables/voice-default.safetensors"
+        public static let tokenizerFile = "tokenizer/grapheme_mtl_merged_expanded_v1.json"
+
+        public static let requiredModels: Set<String> = [
+            prefillFile,
+            decodeFile,
+            flowFile,
+            vocoderFile,
+        ]
+        /// Non-model assets fetched individually (nested under `tables/` and
+        /// `tokenizer/`, which the repo-root model walk does not descend into).
+        public static let auxFiles: [String] = [
+            tablesFile,
+            defaultVoiceFile,
+            tokenizerFile,
+        ]
+    }
+
+    /// Chatterbox Nano model names (`FluidInference/chatterbox-nano-coreml`).
+    public enum ChatterboxNano {
+        public static let prefillFile = "T3Nano-Prefill-T512-M1536-fp16.mlmodelc"
+        public static let decodeFile = "T3Nano-Decode-M1536-fp16-stateful.mlmodelc"
+        public static let flowFile = "FlowMean-N500-fp16.mlmodelc"
+        public static let vocoderFile = "HiFT-T1000-fp16.mlmodelc"
+        /// Larger S3Gen bucket pair (`ChatterboxNanoOutputCapacity.extended`,
+        /// ~30 s of generated audio) — downloaded only when requested.
+        public static let flowFileExtended = "FlowMean-N1000-fp16.mlmodelc"
+        public static let vocoderFileExtended = "HiFT-T2000-fp16.mlmodelc"
+        public static let tablesFile = "tables/tables.safetensors"
+        public static let defaultVoiceFile = "tables/voice-default.safetensors"
+        public static let vocabFile = "tokenizer/vocab.json"
+        public static let mergesFile = "tokenizer/merges.txt"
+        public static let addedTokensFile = "tokenizer/added_tokens.json"
+
+        public static let requiredModels: Set<String> = [
+            prefillFile,
+            decodeFile,
+            flowFile,
+            vocoderFile,
+        ]
+        /// Required model set for an output capacity ("extended" swaps in
+        /// the N1000/T2000 S3Gen pair).
+        public static func requiredModels(capacity: ChatterboxNanoOutputCapacity) -> Set<String> {
+            switch capacity {
+            case .standard:
+                return requiredModels
+            case .extended:
+                return [prefillFile, decodeFile, flowFileExtended, vocoderFileExtended]
+            }
+        }
+        /// Non-model assets fetched individually (nested under `tables/` and
+        /// `tokenizer/`, which the repo-root model walk does not descend into).
+        public static let auxFiles: [String] = [
+            tablesFile,
+            defaultVoiceFile,
+            vocabFile,
+            mergesFile,
+            addedTokensFile,
+        ]
+    }
+
     static func getRequiredModelNames(for repo: Repo, variant: String?) -> Set<String> {
         switch repo {
         case .nemotronMultilingual:
@@ -1644,6 +1762,8 @@ public enum ModelNames {
             return ModelNames.SenseVoice.requiredModels(precision: variant)
         case .campPlus:
             return ModelNames.CampPlus.requiredModels
+        case .cuaS1Forms:
+            return ModelNames.CuaS1Forms.requiredModels
         case .fsmnVad:
             return ModelNames.FsmnVad.requiredModels
         case .paraformerLargeZh:
@@ -1713,6 +1833,12 @@ public enum ModelNames {
             return ModelNames.Supertonic3.requiredFiles(veVariant: variant)
         case .neuTts:
             return ModelNames.NeuTts.requiredModels
+        case .chatterbox:
+            return ModelNames.Chatterbox.requiredModels
+        case .chatterboxNano:
+            // Variant: "extended" → N1000/T2000 S3Gen bucket pair (~30 s).
+            let capacity = ChatterboxNanoOutputCapacity(rawValue: variant ?? "") ?? .standard
+            return ModelNames.ChatterboxNano.requiredModels(capacity: capacity)
         case .luxtts:
             // Variants: "gpu" (macOS) / "ane" (iOS); nil → platform default.
             return ModelNames.LuxTts.requiredFiles(variant: variant)

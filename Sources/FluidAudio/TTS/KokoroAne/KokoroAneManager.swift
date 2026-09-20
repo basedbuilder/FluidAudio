@@ -234,9 +234,12 @@ public actor KokoroAneManager {
     ///
     /// English: Misaki-lexicon-first with BART G2P fallback. Mandarin:
     /// the ``MandarinG2P`` pipeline for Hanzi input, pass-through for
-    /// strings that already look like phonemes. Japanese: no text frontend
-    /// — throws (use ``synthesizeFromPhonemes(_:voice:speed:)`` with
-    /// pre-computed IPA, issue #698).
+    /// strings that already look like phonemes. Japanese: half-width kana
+    /// and range-tilde folding, NeMo written-form normalization, then the
+    /// in-process Cutlet port (MeCab over unidic-lite + Cutlet rules, the
+    /// Kokoro training frontend). A string made only of phoneme-alphabet
+    /// scalars is treated as pre-computed IPA and passed through (issue
+    /// #698); digits, kana and kanji always go through the frontend.
     public func phonemes(for text: String) async throws -> String {
         switch variant {
         case .english:
@@ -268,13 +271,17 @@ public actor KokoroAneManager {
                 return normalized
             }
         case .japanese:
-            // The Japanese variant ships no in-process kana/kanji → IPA
-            // frontend. Text synthesis isn't supported; callers feed
-            // pre-computed IPA via synthesizeFromPhonemes(_:voice:speed:),
-            // which bypasses phonemes(for:) entirely.
-            throw KokoroAneError.inputProcessingFailed(
-                "Japanese variant has no text G2P frontend; call "
-                    + "synthesizeFromPhonemes(_:voice:speed:) with pre-computed IPA (see #698).")
+            // Pre-computed IPA (issue #698) passes through untouched: NFKC
+            // would fold its modifier letters (ʲ → j). Anything outside the
+            // phoneme alphabet — kana, kanji, half-width kana, digits — is
+            // text and goes through normalization and the frontend.
+            guard !Self.looksLikePrecomputedJapaneseIPA(text) else { return text }
+            // The NeMo FST drops half-width dakuten (ｶﾞ → カ) and reads the
+            // full-width tilde as a symbol, so fold both before it runs.
+            let folded = JapaneseCutlet.foldingHalfWidthForms(text)
+            let normalized = NemoTextNormalizer.normalize(folded, language: .japanese)
+            let g2p = try await store.japaneseG2PPipeline()
+            return try await g2p.phonemize(normalized)
         }
     }
 
@@ -399,5 +406,27 @@ public actor KokoroAneManager {
         } catch {
             throw KokoroAneError.audioConversionFailed(error.localizedDescription)
         }
+    }
+
+    /// Every scalar is one Kokoro's Japanese phoneme strings can contain:
+    /// ASCII letters, punctuation and space, IPA and modifier letters,
+    /// combining marks, and the quotes/dashes the frontend emits. Digits,
+    /// kana (full- or half-width) and kanji are text, not phonemes.
+    static func looksLikePrecomputedJapaneseIPA(_ text: String) -> Bool {
+        !text.isEmpty
+            && text.unicodeScalars.allSatisfy { scalar in
+                switch scalar.value {
+                case 0x20, 0x21...0x2F, 0x3A...0x40, 0x5B...0x60, 0x7B...0x7E: return true  // ASCII punctuation, space
+                case 0x41...0x5A, 0x61...0x7A: return true  // ASCII letters
+                case 0x00C0...0x024F: return true  // Latin-1 / Extended-A/B (ɡ ǀ ß …)
+                case 0x0250...0x02AF: return true  // IPA extensions
+                case 0x02B0...0x02FF: return true  // spacing modifier letters (ʲ ʰ ː)
+                case 0x0300...0x036F: return true  // combining diacritics
+                case 0x0370...0x03FF: return true  // Greek (β)
+                case 0x1D00...0x1DBF: return true  // phonetic extensions (ᵝ)
+                case 0x2010...0x2027, 0x2039...0x203A, 0x00AB, 0x00BB: return true  // dashes, quotes, ellipsis
+                default: return false
+                }
+            }
     }
 }
