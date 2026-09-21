@@ -655,6 +655,9 @@ extension ASRBenchmark {
         var modelVersion: AsrModelVersion = .v3  // Default to v3
         var melChunkContext: Bool?  // nil = auto (disabled on v3); see ASRConfig.melChunkContext
         var encoderComputeUnits: MLComputeUnits?  // nil = library default (ANE); see --encoder-compute-units
+        // `.int8` keeps the shipped palettized Encoder.mlmodelc; `.int8V2` selects the
+        // re-quantized Encoder_v2.mlmodelc (issue #760). Benchmarking the two needs a flag.
+        var encoderPrecision: ParakeetEncoderPrecision = .int8
 
         // Check for help flag first
         if arguments.contains("--help") || arguments.contains("-h") {
@@ -728,6 +731,16 @@ extension ASRBenchmark {
                 melChunkContext = false
             case "--mel-context":
                 melChunkContext = true
+            case "--encoder-precision":
+                if i + 1 < arguments.count {
+                    guard let precision = ParakeetEncoderPrecision(rawValue: arguments[i + 1].lowercased()) else {
+                        logger.error(
+                            "Invalid --encoder-precision: \(arguments[i + 1]). Use 'int8', 'int8-v2', or 'int4'.")
+                        exit(1)
+                    }
+                    encoderPrecision = precision
+                    i += 1
+                }
             case "--encoder-compute-units":
                 if i + 1 < arguments.count {
                     switch arguments[i + 1].lowercased() {
@@ -839,7 +852,9 @@ extension ASRBenchmark {
             logger.info("Initializing ASR system...")
             do {
                 let models = try await AsrModels.downloadAndLoad(
-                    version: modelVersion, encoderComputeUnits: encoderComputeUnits)
+                    version: modelVersion,
+                    encoderPrecision: encoderPrecision,
+                    encoderComputeUnits: encoderComputeUnits)
                 try await asrManager.loadModels(models)
                 logger.info("ASR system initialized successfully")
 

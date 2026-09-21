@@ -832,10 +832,26 @@ extension FLEURSBenchmark {
         var debugMode = false
         var singleFile: String? = nil
 
+        // `.int8` is the shipped palettized encoder; `.int8V2` is the re-quantized
+        // Encoder_v2 (issue #760). Comparing them on non-English audio is the point of
+        // this flag — v3 is the multilingual model, so English-only benchmarks cannot
+        // answer whether the re-quantization costs multilingual accuracy.
+        var encoderPrecision: ParakeetEncoderPrecision = .int8
+
         // Parse arguments
         var i = 0
         while i < arguments.count {
             switch arguments[i] {
+            case "--encoder-precision":
+                if i + 1 < arguments.count {
+                    guard let precision = ParakeetEncoderPrecision(rawValue: arguments[i + 1].lowercased()) else {
+                        FileHandle.standardError.write(
+                            Data("Invalid --encoder-precision: \(arguments[i + 1]). Use 'int8', 'int8-v2', or 'int4'.\n".utf8))
+                        exit(1)
+                    }
+                    encoderPrecision = precision
+                    i += 1
+                }
             case "--languages":
                 if i + 1 < arguments.count {
                     let languageArg = arguments[i + 1].lowercased()
@@ -928,7 +944,7 @@ extension FLEURSBenchmark {
 
         do {
             cliLogger.info("Initializing ASR system...")
-            let models = try await AsrModels.downloadAndLoad()
+            let models = try await AsrModels.downloadAndLoad(encoderPrecision: encoderPrecision)
             try await asrManager.loadModels(models)
             cliLogger.info("ASR system initialized")
 

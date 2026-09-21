@@ -157,6 +157,17 @@ public enum CtcEarningsBenchmark {
         if ctcModelPath == nil {
             ctcModelPath = defaultCtcModelPath(for: ctcVariant)
         }
+        if ctcModelPath == nil && autoDownload {
+            // Only the dataset was fetchable via --auto-download; the CTC weights were
+            // not. Comparing the 110m and 0.6B spotters needs both present.
+            print("CTC model for \(ctcVariant.displayName) not cached; downloading...")
+            do {
+                let dir = try await CtcModels.download(variant: ctcVariant)
+                ctcModelPath = dir.path
+            } catch {
+                print("ERROR: CTC model download failed: \(error.localizedDescription)")
+            }
+        }
 
         // Handle auto-download for dataset
         if autoDownload && dataDir == nil {
@@ -1180,7 +1191,7 @@ public enum CtcEarningsBenchmark {
                 --file-id <id>        Run benchmark on a single file (e.g., "4468654_chunk39")
                 --max-files <n>       Maximum number of files to process
                 --output, -o <path>   Output JSON file (default: ctc_earnings_benchmark.json)
-                --auto-download       Download earnings22-kws dataset if not found
+                --auto-download       Download missing earnings22-kws data and CTC weights
                 --keywords <mode>     Keywords mode: 'chunk' or 'file' (default: chunk)
                                       - chunk: Use dictionary.txt (chunk-level keywords) for vocabulary
                                       - file: Use keywords.txt (file-level keywords) for vocabulary
